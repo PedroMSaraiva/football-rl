@@ -28,7 +28,7 @@ from stable_baselines3.common.env_util import make_vec_env
 
 # Configurações de Hardware (otimizado para RTX 4090)
 # RTX 4090 tem 24GB VRAM, pode suportar 32-64 ambientes dependendo da configuração
-NUM_ENVS = int(os.environ.get("NUM_ENVS", "4"))  # Otimizado para 4090
+NUM_ENVS = int(os.environ.get("NUM_ENVS", "32"))  # Otimizado para 4090
 
 # Configurações de Self-Play (sempre ativado)
 ENABLE_SELF_PLAY = True
@@ -41,6 +41,20 @@ ADAPTIVE_CURRICULUM = True
 MIN_WIN_RATE_TO_ADVANCE = float(os.environ.get("MIN_WIN_RATE_TO_ADVANCE", "0.7"))  # 70% vitória
 MIN_EPISODES_FOR_EVAL = int(os.environ.get("MIN_EPISODES_FOR_EVAL", "100"))  # Mínimo de episódios
 WINDOW_SIZE = int(os.environ.get("CURRICULUM_WINDOW_SIZE", "200"))  # Janela de avaliação
+
+# Novos critérios rigorosos de avanço
+MIN_GOAL_DIFFERENCE = int(os.environ.get("MIN_GOAL_DIFFERENCE", "1"))  # Diferença mínima de gols
+MIN_WIN_BY_GOAL_DIFFERENCE_RATE = float(os.environ.get("MIN_WIN_BY_GOAL_DIFFERENCE_RATE", "0.9"))  # 90% das vitórias com >= 1 gol
+MIN_GOALS_SCORED = float(os.environ.get("MIN_GOALS_SCORED", "1.0"))  # Gols médios marcados
+MAX_GOALS_CONCEDED = float(os.environ.get("MAX_GOALS_CONCEDED", "0.5"))  # Gols médios sofridos
+STABILITY_EVALUATIONS = int(os.environ.get("STABILITY_EVALUATIONS", "2"))  # Número de avaliações consecutivas necessárias
+MAX_TIMESTEPS_PER_STAGE = int(os.environ.get("MAX_TIMESTEPS_PER_STAGE", "10000000"))  # Safety net: 10M timesteps
+EVAL_CHUNK_SIZE = int(os.environ.get("EVAL_CHUNK_SIZE", "100000"))  # Verificar a cada 100k timesteps
+
+# Configurações de regressão
+REGRESSION_WIN_RATE_THRESHOLD = float(os.environ.get("REGRESSION_WIN_RATE_THRESHOLD", "0.3"))  # 30% para regressão
+REGRESSION_EVALUATIONS = int(os.environ.get("REGRESSION_EVALUATIONS", "3"))  # 3 avaliações consecutivas
+REGRESSION_COOLDOWN = int(os.environ.get("REGRESSION_COOLDOWN", "5"))  # Cooldown em chunks para evitar oscilação
 
 # Hiperparâmetros otimizados para RTX 4090
 # Ajustados para melhor throughput com mais ambientes paralelos
@@ -59,21 +73,27 @@ VF_COEF = 0.5
 CHECKPOINT_FREQ = int(os.environ.get("CHECKPOINT_FREQ", "50000"))  # A cada 50k steps
 
 # Curriculum: estágios de dificuldade crescente
+# Nota: total_timesteps agora é apenas uma estimativa inicial, o treinamento continua até atingir critérios
 CURRICULUM_STAGES = [
     {
         "name": "stage1_empty_goal",
         "level": "academy_empty_goal_close",
-        "total_timesteps": int(4e6),
+        "total_timesteps": int(8e6),  # Estimativa inicial
     },
     {
         "name": "stage2_run_to_score",
         "level": "academy_run_to_score_with_keeper",
-        "total_timesteps": int(8e6),
+        "total_timesteps": int(12e6),  # Estimativa inicial
+    },
+    {
+        "name": "stage2.5_intermediate",
+        "level": "5_vs_5",  # Estágio intermediário para transição gradual
+        "total_timesteps": int(16e6),  # Estimativa inicial
     },
     {
         "name": "stage3_11v11_easy",
         "level": "11_vs_11_easy_stochastic",
-        "total_timesteps": int(8e6),
+        "total_timesteps": int(20e6),  # Estimativa inicial
     },
 ]
 
@@ -233,12 +253,18 @@ class MatchStatsCallback(BaseCallback):
                 self.total_goals_conceded += right_goals
                 self.total_match_duration += match_duration
                 
+                # Calcular diferença de gols
+                goal_difference = left_goals - right_goals
+                win_by_1plus = (result == "win") and (goal_difference >= MIN_GOAL_DIFFERENCE)
+                
                 # Criar registro da partida
                 match_record = {
                     "episode": self.episode_count,
                     "score": f"{left_goals}-{right_goals}",
                     "left_goals": left_goals,
                     "right_goals": right_goals,
+                    "goal_difference": goal_difference,
+                    "win_by_1plus_goals": win_by_1plus,
                     "result": result,
                     "duration": match_duration,
                     "timestep": self.num_timesteps,
@@ -257,6 +283,55 @@ class MatchStatsCallback(BaseCallback):
                     recent_goals_conceded = sum(m["right_goals"] for m in self.recent_matches)
                     recent_avg_duration = np.mean([m["duration"] for m in self.recent_matches])
                     
+                    # Métricas de diferença de gols
+                    recent_goal_differences = [m["goal_difference"] for m in self.recent_matches]
+                    recent_goal_diff_mean = np.mean(recent_goal_differences)
+                    recent_goal_diff_std = np.std(recent_goal_differences)
+                    recent_wins_by_1plus = sum(1 for m in self.recent_matches if m.get("win_by_1plus_goals", False))
+                    win_by_1plus_rate = recent_wins_by_1plus / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Relação de gols (gols marcados / gols sofridos)
+                    recent_goals_ratio = (
+                        recent_goals_scored / recent_goals_conceded 
+                        if recent_goals_conceded > 0 else float('inf')
+                    )
+                    
+                    # Estatísticas de clean sheets (vitórias sem sofrer gols)
+                    recent_clean_sheets = sum(1 for m in self.recent_matches 
+                                            if m["result"] == "win" and m["right_goals"] == 0)
+                    clean_sheet_rate = recent_clean_sheets / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Estatísticas de goleadas (vitórias por 3+ gols de diferença)
+                    recent_big_wins = sum(1 for m in self.recent_matches 
+                                        if m["result"] == "win" and m["goal_difference"] >= 3)
+                    big_win_rate = recent_big_wins / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Estatísticas de derrotas pesadas (derrotas por 3+ gols de diferença)
+                    recent_big_losses = sum(1 for m in self.recent_matches 
+                                           if m["result"] == "loss" and m["goal_difference"] <= -3)
+                    big_loss_rate = recent_big_losses / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Eficiência ofensiva (gols por episódio)
+                    recent_offensive_efficiency = recent_goals_scored / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Eficiência defensiva (gols sofridos por episódio)
+                    recent_defensive_efficiency = recent_goals_conceded / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Gols por minuto/step (taxa de gols)
+                    total_steps = sum(m["duration"] for m in self.recent_matches)
+                    goals_per_step = recent_goals_scored / total_steps if total_steps > 0 else 0
+                    goals_conceded_per_step = recent_goals_conceded / total_steps if total_steps > 0 else 0
+                    
+                    # Estatísticas de empates com gols
+                    recent_draws_with_goals = sum(1 for m in self.recent_matches 
+                                                 if m["result"] == "draw" and (m["left_goals"] > 0 or m["right_goals"] > 0))
+                    draw_with_goals_rate = recent_draws_with_goals / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    # Estatísticas de partidas sem gols
+                    recent_scoreless = sum(1 for m in self.recent_matches 
+                                          if m["left_goals"] == 0 and m["right_goals"] == 0)
+                    scoreless_rate = recent_scoreless / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
                     win_rate = recent_wins / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
                     draw_rate = recent_draws / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
                     loss_rate = recent_losses / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
@@ -264,6 +339,18 @@ class MatchStatsCallback(BaseCallback):
                     win_rate = draw_rate = loss_rate = 0
                     recent_goals_scored = recent_goals_conceded = 0
                     recent_avg_duration = 0
+                    recent_goal_diff_mean = recent_goal_diff_std = 0
+                    win_by_1plus_rate = 0
+                    recent_goals_ratio = 0
+                    clean_sheet_rate = 0
+                    big_win_rate = 0
+                    big_loss_rate = 0
+                    recent_offensive_efficiency = 0
+                    recent_defensive_efficiency = 0
+                    goals_per_step = 0
+                    goals_conceded_per_step = 0
+                    draw_with_goals_rate = 0
+                    scoreless_rate = 0
                 
                 # Log em wandb, se disponível
                 if self.wandb_run is not None:
@@ -272,6 +359,7 @@ class MatchStatsCallback(BaseCallback):
                             # Estatísticas do episódio atual
                             "match/score_left": left_goals,
                             "match/score_right": right_goals,
+                            "match/goal_difference": goal_difference,
                             "match/result": 1 if result == "win" else (0 if result == "draw" else -1),
                             "match/duration": match_duration,
                             
@@ -283,6 +371,32 @@ class MatchStatsCallback(BaseCallback):
                             "match/avg_goals_conceded": recent_goals_conceded / len(self.recent_matches) if len(self.recent_matches) > 0 else 0,
                             "match/avg_duration": recent_avg_duration,
                             
+                            # Métricas de diferença de gols
+                            "match/goal_difference_mean": recent_goal_diff_mean,
+                            "match/goal_difference_std": recent_goal_diff_std,
+                            "match/win_by_1plus_goals_rate": win_by_1plus_rate,
+                            
+                            # Relações de gols por time
+                            "performance/goals_ratio": recent_goals_ratio if recent_goals_ratio != float('inf') else 999.0,
+                            "performance/goals_scored_per_episode": recent_offensive_efficiency,
+                            "performance/goals_conceded_per_episode": recent_defensive_efficiency,
+                            "performance/goals_per_step": goals_per_step,
+                            "performance/goals_conceded_per_step": goals_conceded_per_step,
+                            
+                            # Estatísticas de desempenho defensivo
+                            "defense/clean_sheet_rate": clean_sheet_rate,
+                            "defense/big_loss_rate": big_loss_rate,
+                            "defense/avg_goals_conceded": recent_defensive_efficiency,
+                            
+                            # Estatísticas de desempenho ofensivo
+                            "offense/big_win_rate": big_win_rate,
+                            "offense/avg_goals_scored": recent_offensive_efficiency,
+                            "offense/goals_per_step": goals_per_step,
+                            
+                            # Estatísticas de partidas
+                            "match/draw_with_goals_rate": draw_with_goals_rate,
+                            "match/scoreless_rate": scoreless_rate,
+                            
                             # Estatísticas totais
                             "match/total_wins": self.total_wins,
                             "match/total_draws": self.total_draws,
@@ -290,10 +404,22 @@ class MatchStatsCallback(BaseCallback):
                             "match/total_goals_scored": self.total_goals_scored,
                             "match/total_goals_conceded": self.total_goals_conceded,
                             
+                            # Relação total de gols
+                            "performance/total_goals_ratio": (
+                                self.total_goals_scored / self.total_goals_conceded 
+                                if self.total_goals_conceded > 0 else float('inf')
+                            ) if (self.total_goals_scored + self.total_goals_conceded) > 0 else 0,
+                            
                             # Metadados
                             "episode": self.episode_count,
                             "stage": self.stage_name,
                         }
+                        # Tratar infinito para logging
+                        if log_dict["performance/goals_ratio"] == float('inf'):
+                            log_dict["performance/goals_ratio"] = 999.0
+                        if log_dict["performance/total_goals_ratio"] == float('inf'):
+                            log_dict["performance/total_goals_ratio"] = 999.0
+                            
                         self.wandb_run.log(log_dict, step=self.num_timesteps)
                     except Exception as e:
                         # Não falhar o treino por causa de logging, mas avisar
@@ -330,6 +456,36 @@ class MatchStatsCallback(BaseCallback):
         if total_matches == 0:
             return {}
         
+        # Calcular métricas de diferença de gols
+        goal_differences = [m.get("goal_difference", 0) for m in self.match_results]
+        wins_by_1plus = sum(1 for m in self.match_results if m.get("win_by_1plus_goals", False))
+        
+        # Estatísticas adicionais de desempenho
+        clean_sheets = sum(1 for m in self.match_results 
+                          if m["result"] == "win" and m["right_goals"] == 0)
+        big_wins = sum(1 for m in self.match_results 
+                      if m["result"] == "win" and m["goal_difference"] >= 3)
+        big_losses = sum(1 for m in self.match_results 
+                        if m["result"] == "loss" and m["goal_difference"] <= -3)
+        scoreless_matches = sum(1 for m in self.match_results 
+                               if m["left_goals"] == 0 and m["right_goals"] == 0)
+        
+        # Relação de gols
+        goals_ratio = (
+            self.total_goals_scored / self.total_goals_conceded 
+            if self.total_goals_conceded > 0 else float('inf')
+        )
+        
+        # Gols por step
+        goals_per_step = (
+            self.total_goals_scored / self.total_match_duration 
+            if self.total_match_duration > 0 else 0
+        )
+        goals_conceded_per_step = (
+            self.total_goals_conceded / self.total_match_duration 
+            if self.total_match_duration > 0 else 0
+        )
+        
         return {
             "total_episodes": self.episode_count,
             "total_wins": self.total_wins,
@@ -341,6 +497,18 @@ class MatchStatsCallback(BaseCallback):
             "avg_goals_scored": self.total_goals_scored / total_matches,
             "avg_goals_conceded": self.total_goals_conceded / total_matches,
             "avg_match_duration": self.total_match_duration / total_matches,
+            "goal_difference_mean": np.mean(goal_differences) if goal_differences else 0,
+            "goal_difference_std": np.std(goal_differences) if goal_differences else 0,
+            "win_by_1plus_goals_rate": wins_by_1plus / total_matches if total_matches > 0 else 0,
+            # Relações de gols
+            "goals_ratio": goals_ratio if goals_ratio != float('inf') else 999.0,
+            "goals_per_step": goals_per_step,
+            "goals_conceded_per_step": goals_conceded_per_step,
+            # Estatísticas de desempenho
+            "clean_sheet_rate": clean_sheets / total_matches if total_matches > 0 else 0,
+            "big_win_rate": big_wins / total_matches if total_matches > 0 else 0,
+            "big_loss_rate": big_losses / total_matches if total_matches > 0 else 0,
+            "scoreless_rate": scoreless_matches / total_matches if total_matches > 0 else 0,
         }
 
 
@@ -367,6 +535,19 @@ class AdaptiveCurriculum:
             stage["name"]: [] for stage in stages
         }
         
+        # Sistema de estabilidade: rastrear avaliações consecutivas que atendem critérios
+        self.stability_tracker: Dict[str, int] = {
+            stage["name"]: 0 for stage in stages
+        }
+        
+        # Sistema de regressão: rastrear avaliações consecutivas com performance baixa
+        self.regression_tracker: Dict[str, int] = {
+            stage["name"]: 0 for stage in stages
+        }
+        self.last_regression_chunk: Dict[str, int] = {
+            stage["name"]: -1 for stage in stages
+        }
+        
     def update_metrics(self, stage_name: str, episode_stats: Dict[str, Any]):
         """Atualiza métricas de um episódio para o estágio atual."""
         if stage_name not in self.stage_metrics:
@@ -381,7 +562,12 @@ class AdaptiveCurriculum:
     def should_advance(self, stage_name: str) -> bool:
         """
         Decide se deve avançar para o próximo estágio.
-        Requer taxa de vitória mínima por N episódios.
+        Requer critérios rigorosos:
+        - Taxa de vitória >= 70%
+        - 90% das vitórias com >= 1 gol de diferença
+        - Gols médios marcados >= 1.0
+        - Gols médios sofridos < 0.5
+        - Estabilidade: critérios mantidos por STABILITY_EVALUATIONS avaliações consecutivas
         """
         if self.current_stage_idx >= len(self.stages) - 1:
             return False  # Já está no último estágio
@@ -390,49 +576,118 @@ class AdaptiveCurriculum:
         if len(metrics) < self.min_episodes:
             return False  # Não tem episódios suficientes
         
-        # Calcular taxa de vitória na janela recente
+        # Calcular métricas na janela recente
         recent_metrics = metrics[-self.min_episodes:]
+        
+        # 1. Taxa de vitória
         wins = sum(1 for m in recent_metrics if m.get("result") == "win")
         win_rate = wins / len(recent_metrics)
         
-        # Também verificar se está marcando gols consistentemente
-        avg_goals = np.mean([m.get("left_goals", 0) for m in recent_metrics])
+        # 2. Gols médios marcados e sofridos
+        avg_goals_scored = np.mean([m.get("left_goals", 0) for m in recent_metrics])
+        avg_goals_conceded = np.mean([m.get("right_goals", 0) for m in recent_metrics])
         
-        should_advance = win_rate >= self.min_win_rate and avg_goals > 0.1
+        # 3. Taxa de vitórias com >= 1 gol de diferença
+        wins_list = [m for m in recent_metrics if m.get("result") == "win"]
+        if len(wins_list) > 0:
+            wins_by_1plus = sum(1 for m in wins_list if m.get("win_by_1plus_goals", False))
+            win_by_1plus_rate = wins_by_1plus / len(wins_list)
+        else:
+            win_by_1plus_rate = 0.0
+        
+        # Verificar todos os critérios
+        criteria_met = (
+            win_rate >= self.min_win_rate and
+            win_by_1plus_rate >= MIN_WIN_BY_GOAL_DIFFERENCE_RATE and
+            avg_goals_scored >= MIN_GOALS_SCORED and
+            avg_goals_conceded < MAX_GOALS_CONCEDED
+        )
+        
+        # Atualizar tracker de estabilidade
+        if criteria_met:
+            self.stability_tracker[stage_name] += 1
+        else:
+            self.stability_tracker[stage_name] = 0
+        
+        # Avançar apenas se critérios foram mantidos por STABILITY_EVALUATIONS avaliações consecutivas
+        should_advance = (
+            criteria_met and 
+            self.stability_tracker[stage_name] >= STABILITY_EVALUATIONS
+        )
         
         if should_advance:
             print(
-                f"✓ Critério de progressão atingido para '{stage_name}': "
-                f"Taxa de vitória: {win_rate:.1%}, Gols médios: {avg_goals:.2f}"
+                f"✓ Critério de progressão atingido para '{stage_name}' "
+                f"(estabilidade: {self.stability_tracker[stage_name]}/{STABILITY_EVALUATIONS}):"
+            )
+            print(f"  - Taxa de vitória: {win_rate:.1%} (>= {self.min_win_rate:.1%})")
+            print(f"  - Vitórias com >=1 gol: {win_by_1plus_rate:.1%} (>= {MIN_WIN_BY_GOAL_DIFFERENCE_RATE:.1%})")
+            print(f"  - Gols médios marcados: {avg_goals_scored:.2f} (>= {MIN_GOALS_SCORED:.1f})")
+            print(f"  - Gols médios sofridos: {avg_goals_conceded:.2f} (< {MAX_GOALS_CONCEDED:.1f})")
+        elif criteria_met:
+            print(
+                f"  Progresso em '{stage_name}': Critérios atendidos "
+                f"({self.stability_tracker[stage_name]}/{STABILITY_EVALUATIONS} avaliações consecutivas)"
             )
         
         return should_advance
     
-    def should_regress(self, stage_name: str) -> bool:
+    def should_regress(self, stage_name: str, current_chunk: int) -> bool:
         """
         Decide se deve regredir para o estágio anterior.
-        Se performance cair muito, pode ser necessário voltar.
+        Critérios para regressão:
+        - Taxa de vitória < REGRESSION_WIN_RATE_THRESHOLD por REGRESSION_EVALUATIONS avaliações consecutivas
+        - Diferença média de gols negativa por REGRESSION_EVALUATIONS avaliações consecutivas
+        - Cooldown para evitar oscilação entre estágios
         """
         if self.current_stage_idx == 0:
             return False  # Já está no primeiro estágio
+        
+        # Verificar cooldown
+        if self.last_regression_chunk[stage_name] >= 0:
+            chunks_since_regression = current_chunk - self.last_regression_chunk[stage_name]
+            if chunks_since_regression < REGRESSION_COOLDOWN:
+                return False  # Ainda em cooldown
         
         metrics = self.stage_metrics.get(stage_name, [])
         if len(metrics) < self.min_episodes:
             return False  # Não tem dados suficientes
         
-        # Se taxa de vitória cair muito abaixo do mínimo
+        # Calcular métricas na janela recente
         recent_metrics = metrics[-self.min_episodes:]
         wins = sum(1 for m in recent_metrics if m.get("result") == "win")
         win_rate = wins / len(recent_metrics)
         
-        # Regredir se win_rate < 30% (muito baixo)
-        should_regress = win_rate < 0.3
+        # Calcular diferença média de gols
+        avg_goal_diff = np.mean([m.get("goal_difference", 0) for m in recent_metrics])
+        
+        # Verificar critérios de regressão
+        should_regress_this_eval = (
+            win_rate < REGRESSION_WIN_RATE_THRESHOLD or
+            avg_goal_diff < 0
+        )
+        
+        # Atualizar tracker de regressão
+        if should_regress_this_eval:
+            self.regression_tracker[stage_name] += 1
+        else:
+            self.regression_tracker[stage_name] = 0
+        
+        # Regredir apenas se critérios foram mantidos por REGRESSION_EVALUATIONS avaliações consecutivas
+        should_regress = (
+            should_regress_this_eval and
+            self.regression_tracker[stage_name] >= REGRESSION_EVALUATIONS
+        )
         
         if should_regress:
             print(
-                f"⚠ Performance muito baixa em '{stage_name}': "
-                f"Taxa de vitória: {win_rate:.1%}. Considerando regressão."
+                f"⚠ Performance muito baixa em '{stage_name}' "
+                f"(regressão: {self.regression_tracker[stage_name]}/{REGRESSION_EVALUATIONS}):"
             )
+            print(f"  - Taxa de vitória: {win_rate:.1%} (< {REGRESSION_WIN_RATE_THRESHOLD:.1%})")
+            print(f"  - Diferença média de gols: {avg_goal_diff:.2f} (< 0)")
+            print(f"  - Regredindo para estágio anterior...")
+            self.last_regression_chunk[stage_name] = current_chunk
         
         return should_regress
     
@@ -569,6 +824,38 @@ class SelfPlayManager:
         return len(self.checkpoint_pool)
 
 
+def get_stage_hyperparams(stage_name: str) -> Dict[str, Any]:
+    """
+    Retorna hiperparâmetros específicos para cada estágio.
+    Estágios iniciais: learning rate mais alto, mais exploração
+    Estágios avançados (11v11): learning rate mais baixo, menos exploração
+    """
+    if "stage1" in stage_name or "stage2" in stage_name:
+        # Estágios iniciais: mais exploração e learning rate mais alto
+        return {
+            "learning_rate": LR * 1.2,  # 20% mais alto
+            "ent_coef": ENT_COEF * 1.5,  # Mais exploração
+            "clip_range": CLIP_RANGE,
+            "n_epochs": N_EPOCHS,
+        }
+    elif "stage3" in stage_name or "11v11" in stage_name:
+        # Estágio 11v11: learning rate mais baixo, menos exploração
+        return {
+            "learning_rate": LR * 0.7,  # 30% mais baixo
+            "ent_coef": ENT_COEF * 0.7,  # Menos exploração
+            "clip_range": CLIP_RANGE * 0.9,  # Clipping mais conservador
+            "n_epochs": N_EPOCHS + 1,  # Mais épocas para estabilidade
+        }
+    else:
+        # Estágios intermediários: valores padrão
+        return {
+            "learning_rate": LR,
+            "ent_coef": ENT_COEF,
+            "clip_range": CLIP_RANGE,
+            "n_epochs": N_EPOCHS,
+        }
+
+
 def make_env_with_opponent(level: str, log_dir: str, opponent_model_path: Optional[str] = None):
     """
     Cria ambiente do gfootball, opcionalmente com oponente controlado por modelo.
@@ -633,6 +920,17 @@ def main():
         "self_play_ratio": SELF_PLAY_RATIO,
         "min_win_rate_to_advance": MIN_WIN_RATE_TO_ADVANCE,
         "checkpoint_freq": CHECKPOINT_FREQ,
+        # Novos critérios rigorosos
+        "min_goal_difference": MIN_GOAL_DIFFERENCE,
+        "min_win_by_goal_difference_rate": MIN_WIN_BY_GOAL_DIFFERENCE_RATE,
+        "min_goals_scored": MIN_GOALS_SCORED,
+        "max_goals_conceded": MAX_GOALS_CONCEDED,
+        "stability_evaluations": STABILITY_EVALUATIONS,
+        "max_timesteps_per_stage": MAX_TIMESTEPS_PER_STAGE,
+        "eval_chunk_size": EVAL_CHUNK_SIZE,
+        "regression_win_rate_threshold": REGRESSION_WIN_RATE_THRESHOLD,
+        "regression_evaluations": REGRESSION_EVALUATIONS,
+        "regression_cooldown": REGRESSION_COOLDOWN,
     }
     
     # Forçar modo interativo para pedir credenciais se necessário
@@ -779,6 +1077,19 @@ def main():
             match_stats_callback,
         ]
 
+        # Obter hiperparâmetros específicos do estágio
+        stage_hyperparams = get_stage_hyperparams(stage_name)
+        stage_lr = stage_hyperparams["learning_rate"]
+        stage_ent_coef = stage_hyperparams["ent_coef"]
+        stage_clip_range = stage_hyperparams["clip_range"]
+        stage_n_epochs = stage_hyperparams["n_epochs"]
+        
+        print(f"  Hiperparâmetros do estágio '{stage_name}':")
+        print(f"    Learning rate: {stage_lr:.6f} (padrão: {LR:.6f})")
+        print(f"    Entropy coef: {stage_ent_coef:.6f} (padrão: {ENT_COEF:.6f})")
+        print(f"    Clip range: {stage_clip_range:.3f} (padrão: {CLIP_RANGE:.3f})")
+        print(f"    N epochs: {stage_n_epochs} (padrão: {N_EPOCHS})")
+        
         # Cria o modelo no primeiro estágio; nos demais, reaproveita e continua treinando
         if model is None:
             # Calcular batch_size a partir de NUM_ENVS agora definido
@@ -787,14 +1098,14 @@ def main():
             model = PPO(
                 "CnnPolicy",
                 env,
-                learning_rate=LR,
+                learning_rate=stage_lr,
                 n_steps=N_STEPS,
                 batch_size=batch_size,
-                n_epochs=N_EPOCHS,
+                n_epochs=stage_n_epochs,
                 gamma=GAMMA,
                 gae_lambda=GAE_LAMBDA,
-                clip_range=CLIP_RANGE,
-                ent_coef=ENT_COEF,
+                clip_range=stage_clip_range,
+                ent_coef=stage_ent_coef,
                 vf_coef=VF_COEF,
                 max_grad_norm=MAX_GRAD_NORM,
                 verbose=1,
@@ -804,21 +1115,37 @@ def main():
         else:
             # Atualiza o ambiente e continua o treinamento (continual learning)
             model.set_env(env)
+            
+            # Atualizar hiperparâmetros do modelo se necessário
+            # Nota: stable-baselines3 não permite mudar todos os hiperparâmetros após criação
+            # Mas podemos ajustar learning_rate via schedule
+            if hasattr(model, "lr_schedule"):
+                # Tentar atualizar learning rate se possível
+                try:
+                    # Criar novo schedule com o learning rate do estágio
+                    from stable_baselines3.common.utils import get_linear_fn
+                    model.lr_schedule = get_linear_fn(stage_lr, stage_lr)
+                except:
+                    pass
 
         # Treinar neste estágio
         reset_num_timesteps = stage_idx == 0
         print(
             f"Iniciando treinamento do estágio '{stage_name}' "
-            f"por {total_timesteps:,} timesteps..."
+            f"(treinará até atingir critérios ou máximo de {MAX_TIMESTEPS_PER_STAGE:,} timesteps)..."
         )
         
-        # Treinar em chunks menores para permitir avaliação adaptativa
+        # Treinar em chunks menores para permitir avaliação adaptativa frequente
         timesteps_trained = 0
-        chunk_size = min(500_000, total_timesteps)  # Chunks de 500k para avaliação
+        chunk_size = EVAL_CHUNK_SIZE  # Chunks de 100k para avaliação mais frequente
+        chunk_count = 0
         
-        while timesteps_trained < total_timesteps:
-            remaining = total_timesteps - timesteps_trained
-            current_chunk = min(chunk_size, remaining)
+        # Loop de treinamento: continua até critérios serem atingidos ou limite máximo
+        while timesteps_trained < MAX_TIMESTEPS_PER_STAGE:
+            current_chunk = min(chunk_size, MAX_TIMESTEPS_PER_STAGE - timesteps_trained)
+            
+            print(f"  Chunk {chunk_count + 1}: Treinando {current_chunk:,} timesteps "
+                  f"(total: {timesteps_trained:,}/{MAX_TIMESTEPS_PER_STAGE:,})")
             
             model.learn(
                 total_timesteps=current_chunk,
@@ -828,6 +1155,7 @@ def main():
             )
             
             timesteps_trained += current_chunk
+            chunk_count += 1
             
             # Atualizar métricas do curriculum adaptativo (sempre ativo)
             stats = match_stats_callback.get_match_stats()
@@ -839,30 +1167,55 @@ def main():
                 # Verificar se deve avançar
                 if adaptive_curriculum.should_advance(stage_name):
                     adaptive_curriculum.advance()
+                    print(f"✓ Estágio '{stage_name}' concluído após {timesteps_trained:,} timesteps")
                     break  # Sair do loop e ir para próximo estágio
                 
-                # Verificar se deve regredir (opcional, pode ser muito agressivo)
-                # if adaptive_curriculum.should_regress(stage_name):
-                #     adaptive_curriculum.regress()
-                #     break
+                # Verificar se deve regredir (agora ativado com critérios melhorados)
+                if adaptive_curriculum.should_regress(stage_name, chunk_count):
+                    adaptive_curriculum.regress()
+                    print(f"← Regredindo após {timesteps_trained:,} timesteps")
+                    break  # Sair do loop e voltar ao estágio anterior
                 
                 # Logar progresso do curriculum e self-play (sempre ativo)
                 try:
                     difficulty = adaptive_curriculum.get_current_difficulty()
+                    stability_count = adaptive_curriculum.stability_tracker.get(stage_name, 0)
+                    regression_count = adaptive_curriculum.regression_tracker.get(stage_name, 0)
+                    
                     log_dict = {
                         "curriculum/current_stage": stage_idx,
                         "curriculum/stage_name": stage_name,
                         "curriculum/win_rate": difficulty["win_rate"],
                         "curriculum/episodes": difficulty["episodes"],
                         "curriculum/recent_episodes": difficulty["recent_episodes"],
+                        "curriculum/stability_count": stability_count,
+                        "curriculum/regression_count": regression_count,
+                        "curriculum/timesteps_trained": timesteps_trained,
+                        "curriculum/chunk_count": chunk_count,
                         "self_play/opponent_pool_size": self_play_manager.get_pool_size(),
                         "self_play/enabled": ENABLE_SELF_PLAY,
                         "self_play/ratio": SELF_PLAY_RATIO,
                     }
+                    
+                    # Adicionar métricas de diferença de gols se disponíveis
+                    if stats:
+                        log_dict.update({
+                            "curriculum/goal_difference_mean": stats.get("goal_difference_mean", 0),
+                            "curriculum/win_by_1plus_goals_rate": stats.get("win_by_1plus_goals_rate", 0),
+                            "curriculum/avg_goals_scored": stats.get("avg_goals_scored", 0),
+                            "curriculum/avg_goals_conceded": stats.get("avg_goals_conceded", 0),
+                        })
+                    
                     wandb_run.log(log_dict, step=model.num_timesteps)
                 except Exception as e:
-                    if timesteps_trained % 100_000 == 0:  # Log erro ocasionalmente
+                    if chunk_count % 10 == 0:  # Log erro ocasionalmente
                         print(f"⚠ Erro ao logar no wandb: {e}")
+            
+            # Verificar se atingiu o limite máximo (safety net)
+            if timesteps_trained >= MAX_TIMESTEPS_PER_STAGE:
+                print(f"⚠ Limite máximo de timesteps atingido para '{stage_name}' "
+                      f"({MAX_TIMESTEPS_PER_STAGE:,}). Avançando mesmo sem atingir critérios.")
+                break
 
         # Salvar um snapshot ao final de cada estágio
         stage_final_path = os.path.join(
@@ -884,16 +1237,26 @@ def main():
         try:
             stats = match_stats_callback.get_match_stats()
             difficulty = adaptive_curriculum.get_current_difficulty()
+            stability_count = adaptive_curriculum.stability_tracker.get(stage_name, 0)
+            
             log_dict = {
                 "stage_completed": stage_name,
-                "stage_total_timesteps": total_timesteps,
+                "stage_total_timesteps": timesteps_trained,
+                "stage_chunks": chunk_count,
                 "curriculum/final_win_rate": difficulty["win_rate"],
                 "curriculum/final_episodes": difficulty["episodes"],
+                "curriculum/final_stability_count": stability_count,
                 "self_play/final_pool_size": self_play_manager.get_pool_size(),
             }
             if stats:
                 log_dict.update({
                     f"stage_final/{k}": v for k, v in stats.items()
+                })
+                # Adicionar métricas específicas de diferença de gols
+                log_dict.update({
+                    "stage_final/goal_difference_mean": stats.get("goal_difference_mean", 0),
+                    "stage_final/goal_difference_std": stats.get("goal_difference_std", 0),
+                    "stage_final/win_by_1plus_goals_rate": stats.get("win_by_1plus_goals_rate", 0),
                 })
             
             wandb_run.log(log_dict, step=model.num_timesteps)
