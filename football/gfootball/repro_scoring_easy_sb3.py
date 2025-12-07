@@ -74,26 +74,100 @@ CHECKPOINT_FREQ = int(os.environ.get("CHECKPOINT_FREQ", "50000"))  # A cada 50k 
 
 # Curriculum: estágios de dificuldade crescente
 # Nota: total_timesteps agora é apenas uma estimativa inicial, o treinamento continua até atingir critérios
+# Ordem crescente de dificuldade baseada nos cenários disponíveis
 CURRICULUM_STAGES = [
+    # Estágio 1: Gol vazio (mais fácil)
     {
-        "name": "stage1_empty_goal",
+        "name": "stage1_empty_goal_close",
         "level": "academy_empty_goal_close",
-        "total_timesteps": int(8e6),  # Estimativa inicial
+        "total_timesteps": int(6e6),
     },
+    {
+        "name": "stage1.5_empty_goal",
+        "level": "academy_empty_goal",
+        "total_timesteps": int(6e6),
+    },
+    # Estágio 2: Correr para marcar (sem goleiro)
     {
         "name": "stage2_run_to_score",
+        "level": "academy_run_to_score",
+        "total_timesteps": int(8e6),
+    },
+    # Estágio 3: Correr para marcar com goleiro
+    {
+        "name": "stage3_run_to_score_with_keeper",
         "level": "academy_run_to_score_with_keeper",
-        "total_timesteps": int(12e6),  # Estimativa inicial
+        "total_timesteps": int(10e6),
+    },
+    # Estágio 4: Passar e chutar com goleiro
+    {
+        "name": "stage4_pass_and_shoot_with_keeper",
+        "level": "academy_pass_and_shoot_with_keeper",
+        "total_timesteps": int(10e6),
     },
     {
-        "name": "stage2.5_intermediate",
-        "level": "5_vs_5",  # Estágio intermediário para transição gradual
-        "total_timesteps": int(16e6),  # Estimativa inicial
+        "name": "stage4.5_run_pass_and_shoot_with_keeper",
+        "level": "academy_run_pass_and_shoot_with_keeper",
+        "total_timesteps": int(10e6),
+    },
+    # Estágio 5: Situações mais complexas
+    {
+        "name": "stage5_3_vs_1_with_keeper",
+        "level": "academy_3_vs_1_with_keeper",
+        "total_timesteps": int(12e6),
     },
     {
-        "name": "stage3_11v11_easy",
+        "name": "stage5.5_corner",
+        "level": "academy_corner",
+        "total_timesteps": int(12e6),
+    },
+    # Estágio 6: Contra-ataques
+    {
+        "name": "stage6_counterattack_easy",
+        "level": "academy_counterattack_easy",
+        "total_timesteps": int(14e6),
+    },
+    {
+        "name": "stage6.5_counterattack_hard",
+        "level": "academy_counterattack_hard",
+        "total_timesteps": int(14e6),
+    },
+    # Estágio 7: Jogos pequenos
+    {
+        "name": "stage7_1v1_easy",
+        "level": "1_vs_1_easy",
+        "total_timesteps": int(16e6),
+    },
+    {
+        "name": "stage7.5_5v5",
+        "level": "5_vs_5",
+        "total_timesteps": int(16e6),
+    },
+    # Estágio 8: Jogos completos (11v11)
+    {
+        "name": "stage8_single_goal_versus_lazy",
+        "level": "academy_single_goal_versus_lazy",
+        "total_timesteps": int(18e6),
+    },
+    {
+        "name": "stage8.5_11v11_easy",
         "level": "11_vs_11_easy_stochastic",
-        "total_timesteps": int(20e6),  # Estimativa inicial
+        "total_timesteps": int(20e6),
+    },
+    {
+        "name": "stage9_11v11_stochastic",
+        "level": "11_vs_11_stochastic",
+        "total_timesteps": int(22e6),
+    },
+    {
+        "name": "stage9.5_11v11_hard",
+        "level": "11_vs_11_hard_stochastic",
+        "total_timesteps": int(24e6),
+    },
+    {
+        "name": "stage10_11v11_competition",
+        "level": "11_vs_11_competition",
+        "total_timesteps": int(26e6),
     },
 ]
 
@@ -122,12 +196,33 @@ class ScoreInfoWrapper:
         self.last_observation = obs
         
         # Quando o episódio termina, adicionar score ao info
-        if done and self.last_observation is not None:
-            # Tentar obter score da observação
-            if isinstance(self.last_observation, dict) and "score" in self.last_observation:
-                info["score"] = self.last_observation["score"]
-            elif hasattr(self.last_observation, "score"):
-                info["score"] = self.last_observation.score
+        if done:
+            # O score está sempre na observação como um dict com chave 'score'
+            # que é uma lista [left_goals, right_goals]
+            if isinstance(obs, dict) and "score" in obs:
+                score = obs["score"]
+                # Garantir que é uma lista/array
+                if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
+                    info["score"] = [int(score[0]), int(score[1])]
+                else:
+                    # Fallback: tentar converter
+                    try:
+                        info["score"] = [int(score[0]), int(score[1])]
+                    except:
+                        info["score"] = [0, 0]
+            else:
+                # Se não encontrou na observação atual, tentar da última observação
+                if self.last_observation is not None:
+                    if isinstance(self.last_observation, dict) and "score" in self.last_observation:
+                        score = self.last_observation["score"]
+                        if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
+                            info["score"] = [int(score[0]), int(score[1])]
+                        else:
+                            info["score"] = [0, 0]
+                    else:
+                        info["score"] = [0, 0]
+                else:
+                    info["score"] = [0, 0]
         
         return obs, reward, done, info
     
@@ -212,21 +307,69 @@ class MatchStatsCallback(BaseCallback):
                 if isinstance(obs, dict) and "score" in obs:
                     score = obs["score"]
             
+            # Se ainda não encontrou, tentar obter do env diretamente (último recurso)
+            if score is None:
+                # Tentar acessar o ambiente diretamente
+                try:
+                    envs = self.locals.get("env", None)
+                    if envs is not None:
+                        # Em ambientes vetorizados, pode ser uma lista ou VecEnv
+                        if isinstance(envs, list) and idx < len(envs):
+                            env = envs[idx]
+                            # Tentar obter do wrapper ScoreInfoWrapper
+                            if hasattr(env, "last_observation"):
+                                last_obs = env.last_observation
+                                if isinstance(last_obs, dict) and "score" in last_obs:
+                                    score = last_obs["score"]
+                            # Tentar obter do env interno
+                            elif hasattr(env, "env"):
+                                inner_env = env.env
+                                if hasattr(inner_env, "last_observation"):
+                                    last_obs = inner_env.last_observation
+                                    if isinstance(last_obs, dict) and "score" in last_obs:
+                                        score = last_obs["score"]
+                except Exception as e:
+                    # Silenciosamente ignorar erros de acesso ao env
+                    pass
+            
+            # Se encontrou o score, processar
+            # IMPORTANTE: Mesmo se score for None, vamos tentar processar com valores padrão
+            # para garantir que as métricas sejam sempre logadas
             if score is not None:
                 self.episode_count += 1
                 
-                # Parse do score (pode ser string ou lista)
+                # Parse do score (pode ser string, lista, ou array numpy)
                 if isinstance(score, str):
                     # Formato "X-Y" ou similar
                     try:
-                        left_goals, right_goals = map(int, score.split("-"))
+                        parts = score.split("-")
+                        if len(parts) >= 2:
+                            left_goals, right_goals = map(int, parts[:2])
+                        else:
+                            left_goals, right_goals = 0, 0
                     except:
                         left_goals, right_goals = 0, 0
-                elif isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
-                    left_goals = int(score[0])
-                    right_goals = int(score[1])
+                elif isinstance(score, (list, tuple, np.ndarray)):
+                    # Score é uma lista/array [left_goals, right_goals]
+                    try:
+                        if len(score) >= 2:
+                            left_goals = int(score[0])
+                            right_goals = int(score[1])
+                        else:
+                            left_goals, right_goals = 0, 0
+                    except (ValueError, TypeError, IndexError):
+                        left_goals, right_goals = 0, 0
                 else:
-                    left_goals, right_goals = 0, 0
+                    # Tentar converter para lista
+                    try:
+                        score_list = list(score) if hasattr(score, '__iter__') else [score, 0]
+                        if len(score_list) >= 2:
+                            left_goals = int(score_list[0])
+                            right_goals = int(score_list[1])
+                        else:
+                            left_goals, right_goals = 0, 0
+                    except:
+                        left_goals, right_goals = 0, 0
                 
                 # Determinar resultado (assumindo que o agente joga no time esquerdo)
                 if left_goals > right_goals:
@@ -352,11 +495,11 @@ class MatchStatsCallback(BaseCallback):
                     draw_with_goals_rate = 0
                     scoreless_rate = 0
                 
-                # Log em wandb, se disponível
+                # Log em wandb, se disponível - SEMPRE logar, mesmo que score seja 0-0
                 if self.wandb_run is not None:
                     try:
                         log_dict = {
-                            # Estatísticas do episódio atual
+                            # Estatísticas do episódio atual (SEMPRE logar)
                             "match/score_left": left_goals,
                             "match/score_right": right_goals,
                             "match/goal_difference": goal_difference,
@@ -420,11 +563,177 @@ class MatchStatsCallback(BaseCallback):
                         if log_dict["performance/total_goals_ratio"] == float('inf'):
                             log_dict["performance/total_goals_ratio"] = 999.0
                             
-                        self.wandb_run.log(log_dict, step=self.num_timesteps)
+                        # SEMPRE logar no wandb - garantir que as métricas sejam publicadas
+                        self.wandb_run.log(log_dict, step=self.num_timesteps, commit=True)
                     except Exception as e:
                         # Não falhar o treino por causa de logging, mas avisar
                         if self.episode_count % 100 == 0:
                             print(f"⚠ Aviso: Erro ao logar no wandb: {e}")
+                            import traceback
+                            traceback.print_exc()
+            else:
+                # Se não encontrou score, usar valores padrão (0-0) mas ainda processar
+                # para garantir que as métricas sejam sempre logadas
+                self.episode_count += 1
+                left_goals, right_goals = 0, 0
+                result = "draw"
+                self.total_draws += 1
+                match_duration = info.get("episode", {}).get("l", 0)
+                if match_duration == 0 and observations is not None and idx < len(observations):
+                    obs = observations[idx]
+                    if isinstance(obs, dict) and "steps_left" in obs:
+                        match_duration = 3000 - obs.get("steps_left", 0)
+                
+                self.total_match_duration += match_duration
+                goal_difference = 0
+                win_by_1plus = False
+                
+                # Criar registro da partida mesmo sem score
+                match_record = {
+                    "episode": self.episode_count,
+                    "score": "0-0",
+                    "left_goals": 0,
+                    "right_goals": 0,
+                    "goal_difference": 0,
+                    "win_by_1plus_goals": False,
+                    "result": "draw",
+                    "duration": match_duration,
+                    "timestep": self.num_timesteps,
+                }
+                
+                self.match_results.append(match_record)
+                self.recent_matches.append(match_record)
+                self.episode_scores.append("0-0")
+                
+                # Calcular estatísticas da janela recente
+                if len(self.recent_matches) > 0:
+                    recent_wins = sum(1 for m in self.recent_matches if m["result"] == "win")
+                    recent_draws = sum(1 for m in self.recent_matches if m["result"] == "draw")
+                    recent_losses = sum(1 for m in self.recent_matches if m["result"] == "loss")
+                    recent_goals_scored = sum(m["left_goals"] for m in self.recent_matches)
+                    recent_goals_conceded = sum(m["right_goals"] for m in self.recent_matches)
+                    recent_avg_duration = np.mean([m["duration"] for m in self.recent_matches])
+                    
+                    recent_goal_differences = [m["goal_difference"] for m in self.recent_matches]
+                    recent_goal_diff_mean = np.mean(recent_goal_differences)
+                    recent_goal_diff_std = np.std(recent_goal_differences)
+                    recent_wins_by_1plus = sum(1 for m in self.recent_matches if m.get("win_by_1plus_goals", False))
+                    win_by_1plus_rate = recent_wins_by_1plus / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    recent_goals_ratio = (
+                        recent_goals_scored / recent_goals_conceded 
+                        if recent_goals_conceded > 0 else float('inf')
+                    )
+                    
+                    recent_clean_sheets = sum(1 for m in self.recent_matches 
+                                            if m["result"] == "win" and m["right_goals"] == 0)
+                    clean_sheet_rate = recent_clean_sheets / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    recent_big_wins = sum(1 for m in self.recent_matches 
+                                        if m["result"] == "win" and m["goal_difference"] >= 3)
+                    big_win_rate = recent_big_wins / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    recent_big_losses = sum(1 for m in self.recent_matches 
+                                           if m["result"] == "loss" and m["goal_difference"] <= -3)
+                    big_loss_rate = recent_big_losses / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    recent_offensive_efficiency = recent_goals_scored / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    recent_defensive_efficiency = recent_goals_conceded / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    total_steps = sum(m["duration"] for m in self.recent_matches)
+                    goals_per_step = recent_goals_scored / total_steps if total_steps > 0 else 0
+                    goals_conceded_per_step = recent_goals_conceded / total_steps if total_steps > 0 else 0
+                    
+                    recent_draws_with_goals = sum(1 for m in self.recent_matches 
+                                                 if m["result"] == "draw" and (m["left_goals"] > 0 or m["right_goals"] > 0))
+                    draw_with_goals_rate = recent_draws_with_goals / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    recent_scoreless = sum(1 for m in self.recent_matches 
+                                          if m["left_goals"] == 0 and m["right_goals"] == 0)
+                    scoreless_rate = recent_scoreless / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    
+                    win_rate = recent_wins / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    draw_rate = recent_draws / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                    loss_rate = recent_losses / len(self.recent_matches) if len(self.recent_matches) > 0 else 0
+                else:
+                    win_rate = draw_rate = loss_rate = 0
+                    recent_goals_scored = recent_goals_conceded = 0
+                    recent_avg_duration = 0
+                    recent_goal_diff_mean = recent_goal_diff_std = 0
+                    win_by_1plus_rate = 0
+                    recent_goals_ratio = 0
+                    clean_sheet_rate = 0
+                    big_win_rate = 0
+                    big_loss_rate = 0
+                    recent_offensive_efficiency = 0
+                    recent_defensive_efficiency = 0
+                    goals_per_step = 0
+                    goals_conceded_per_step = 0
+                    draw_with_goals_rate = 0
+                    scoreless_rate = 0
+                
+                # Log em wandb mesmo sem score encontrado (usando valores padrão)
+                if self.wandb_run is not None:
+                    try:
+                        log_dict = {
+                            "match/score_left": 0,
+                            "match/score_right": 0,
+                            "match/goal_difference": 0,
+                            "match/result": 0,
+                            "match/duration": match_duration,
+                            "match/win_rate": win_rate,
+                            "match/draw_rate": draw_rate,
+                            "match/loss_rate": loss_rate,
+                            "match/avg_goals_scored": recent_goals_scored / len(self.recent_matches) if len(self.recent_matches) > 0 else 0,
+                            "match/avg_goals_conceded": recent_goals_conceded / len(self.recent_matches) if len(self.recent_matches) > 0 else 0,
+                            "match/avg_duration": recent_avg_duration,
+                            "match/goal_difference_mean": recent_goal_diff_mean,
+                            "match/goal_difference_std": recent_goal_diff_std,
+                            "match/win_by_1plus_goals_rate": win_by_1plus_rate,
+                            "performance/goals_ratio": recent_goals_ratio if recent_goals_ratio != float('inf') else 999.0,
+                            "performance/goals_scored_per_episode": recent_offensive_efficiency,
+                            "performance/goals_conceded_per_episode": recent_defensive_efficiency,
+                            "performance/goals_per_step": goals_per_step,
+                            "performance/goals_conceded_per_step": goals_conceded_per_step,
+                            "defense/clean_sheet_rate": clean_sheet_rate,
+                            "defense/big_loss_rate": big_loss_rate,
+                            "defense/avg_goals_conceded": recent_defensive_efficiency,
+                            "offense/big_win_rate": big_win_rate,
+                            "offense/avg_goals_scored": recent_offensive_efficiency,
+                            "offense/goals_per_step": goals_per_step,
+                            "match/draw_with_goals_rate": draw_with_goals_rate,
+                            "match/scoreless_rate": scoreless_rate,
+                            "match/total_wins": self.total_wins,
+                            "match/total_draws": self.total_draws,
+                            "match/total_losses": self.total_losses,
+                            "match/total_goals_scored": self.total_goals_scored,
+                            "match/total_goals_conceded": self.total_goals_conceded,
+                            "performance/total_goals_ratio": (
+                                self.total_goals_scored / self.total_goals_conceded 
+                                if self.total_goals_conceded > 0 else float('inf')
+                            ) if (self.total_goals_scored + self.total_goals_conceded) > 0 else 0,
+                            "episode": self.episode_count,
+                            "stage": self.stage_name,
+                            "match/score_not_found": 1,  # Flag para indicar que score não foi encontrado
+                        }
+                        if log_dict["performance/goals_ratio"] == float('inf'):
+                            log_dict["performance/goals_ratio"] = 999.0
+                        if log_dict["performance/total_goals_ratio"] == float('inf'):
+                            log_dict["performance/total_goals_ratio"] = 999.0
+                        
+                        self.wandb_run.log(log_dict, step=self.num_timesteps, commit=True)
+                    except Exception as e:
+                        if self.episode_count % 100 == 0:
+                            print(f"⚠ Aviso: Erro ao logar no wandb (sem score): {e}")
+                
+                # Logar aviso ocasionalmente
+                if self.episode_count % 100 == 0:
+                    print(f"⚠ Aviso: Score não encontrado para episódio {self.episode_count} (usando 0-0)")
+                    print(f"  Info keys: {list(info.keys()) if info else 'None'}")
+                    if observations is not None and idx < len(observations):
+                        obs = observations[idx]
+                        if isinstance(obs, dict):
+                            print(f"  Observation keys: {list(obs.keys())[:10]}...")
 
                 # Impressão periódica
                 if (
