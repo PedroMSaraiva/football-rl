@@ -22,8 +22,13 @@ services:
     shm_size: '2g'
 
     volumes:
+      # Montar a pasta football em /workspace/football (para desenvolvimento)
       - ../football:/workspace/football
-      - ./:/RL  # Map current folder to /dev inside the container for live development
+      # IMPORTANTE: Também montar em /gfootball para sobrescrever arquivos copiados no build
+      # Isso garante que repro_scoring_easy_sb3.py e outros arquivos sejam sempre atualizados
+      - ../football:/gfootball
+      # Montar a pasta atual para logs, checkpoints, etc.
+      - ./:/RL
     # ports:
     #   - "6006:6006"  # Example: TensorBoard port
     environment:

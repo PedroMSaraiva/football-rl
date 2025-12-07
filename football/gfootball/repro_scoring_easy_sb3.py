@@ -10,6 +10,7 @@ com:
 
 import os
 import collections
+import shutil
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 
@@ -28,7 +29,7 @@ from stable_baselines3.common.env_util import make_vec_env
 
 # Configurações de Hardware (otimizado para RTX 4090)
 # RTX 4090 tem 24GB VRAM, pode suportar 32-64 ambientes dependendo da configuração
-NUM_ENVS = int(os.environ.get("NUM_ENVS", "32"))  # Otimizado para 4090
+NUM_ENVS = int(os.environ.get("NUM_ENVS", "64"))  # Otimizado para 4090
 
 # Configurações de Self-Play (sempre ativado)
 ENABLE_SELF_PLAY = True
@@ -564,6 +565,7 @@ class MatchStatsCallback(BaseCallback):
                             log_dict["performance/total_goals_ratio"] = 999.0
                             
                         # SEMPRE logar no wandb - garantir que as métricas sejam publicadas
+                        # Usar commit=True para forçar o envio imediato
                         self.wandb_run.log(log_dict, step=self.num_timesteps, commit=True)
                     except Exception as e:
                         # Não falhar o treino por causa de logging, mas avisar
@@ -571,6 +573,35 @@ class MatchStatsCallback(BaseCallback):
                             print(f"⚠ Aviso: Erro ao logar no wandb: {e}")
                             import traceback
                             traceback.print_exc()
+                
+                # Logar periodicamente mesmo sem episódio completo para garantir visibilidade
+                if self.episode_count > 0 and self.episode_count % 50 == 0:
+                    try:
+                        if self.wandb_run is not None:
+                            # Logar estatísticas agregadas mesmo sem novo episódio
+                            stats_summary = {
+                                "match/total_episodes": self.episode_count,
+                                "match/total_wins": self.total_wins,
+                                "match/total_draws": self.total_draws,
+                                "match/total_losses": self.total_losses,
+                                "match/total_goals_scored": self.total_goals_scored,
+                                "match/total_goals_conceded": self.total_goals_conceded,
+                                "match/overall_win_rate": (
+                                    self.total_wins / self.episode_count 
+                                    if self.episode_count > 0 else 0
+                                ),
+                                "match/overall_avg_goals_scored": (
+                                    self.total_goals_scored / self.episode_count 
+                                    if self.episode_count > 0 else 0
+                                ),
+                                "match/overall_avg_goals_conceded": (
+                                    self.total_goals_conceded / self.episode_count 
+                                    if self.episode_count > 0 else 0
+                                ),
+                            }
+                            self.wandb_run.log(stats_summary, step=self.num_timesteps, commit=False)
+                    except:
+                        pass  # Ignorar erros no log periódico
             else:
                 # Se não encontrou score, usar valores padrão (0-0) mas ainda processar
                 # para garantir que as métricas sejam sempre logadas
@@ -1195,7 +1226,235 @@ def make_env_with_opponent(level: str, log_dir: str, opponent_model_path: Option
     return env
 
 
+def validate_curriculum_setup() -> bool:
+    """
+    Valida se todos os estágios do curriculum podem ser executados.
+    Verifica:
+    - Existência e criação de cada nível/cenário
+    - Criação de diretórios necessários
+    - Recursos do sistema (GPU, memória)
+    - Configurações básicas
+    
+    Retorna True se tudo estiver OK, False caso contrário.
+    """
+    print("\n" + "="*80)
+    print("VALIDANDO CONFIGURAÇÃO DO CURRICULUM LEARNING")
+    print("="*80)
+    
+    all_checks_passed = True
+    
+    # ==========
+    # Check 1: Verificar GPU e recursos
+    # ==========
+    print("\n[CHECK 1/5] Verificando recursos do sistema...")
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"  ✓ GPU detectada: {gpu_name} ({gpu_memory:.1f} GB)")
+            if gpu_memory < 20:
+                print(f"  ⚠ Aviso: GPU com menos de 20GB pode ter problemas com {NUM_ENVS} ambientes")
+            else:
+                print(f"  ✓ Memória GPU suficiente para {NUM_ENVS} ambientes")
+        else:
+            print(f"  ⚠ GPU não disponível, usando CPU (pode ser muito lento)")
+    except ImportError:
+        print(f"  ⚠ PyTorch não disponível")
+    
+    print(f"  ✓ Número de ambientes: {NUM_ENVS}")
+    print(f"  ✓ Batch size calculado: {(N_STEPS * NUM_ENVS) // N_MINIBATCHES}")
+    
+    # ==========
+    # Check 2: Verificar diretórios
+    # ==========
+    print("\n[CHECK 2/5] Verificando diretórios...")
+    directories = {
+        "Logs": LOG_DIR_BASE,
+        "Checkpoints": CHECKPOINT_DIR_BASE,
+        "Avaliações": EVAL_DIR_BASE,
+    }
+    
+    for name, path in directories.items():
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.path.exists(path) and os.path.isdir(path):
+                # Verificar permissões de escrita
+                test_file = os.path.join(path, ".test_write")
+                try:
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    os.remove(test_file)
+                    print(f"  ✓ {name}: {path} (criado e com permissão de escrita)")
+                except Exception as e:
+                    print(f"  ✗ {name}: {path} (sem permissão de escrita: {e})")
+                    all_checks_passed = False
+            else:
+                print(f"  ✗ {name}: {path} (não foi possível criar)")
+                all_checks_passed = False
+        except Exception as e:
+            print(f"  ✗ {name}: {path} (erro: {e})")
+            all_checks_passed = False
+    
+    # ==========
+    # Check 3: Verificar cada estágio do curriculum
+    # ==========
+    print("\n[CHECK 3/5] Verificando estágios do curriculum...")
+    print(f"  Total de estágios: {len(CURRICULUM_STAGES)}")
+    
+    for idx, stage in enumerate(CURRICULUM_STAGES):
+        stage_name = stage["name"]
+        level = stage["level"]
+        total_timesteps = stage["total_timesteps"]
+        
+        print(f"\n  Estágio {idx+1}/{len(CURRICULUM_STAGES)}: {stage_name}")
+        print(f"    Nível: {level}")
+        print(f"    Timesteps planejados: {total_timesteps:,}")
+        
+        # Verificar se o nível pode ser criado
+        try:
+            test_log_dir = os.path.join(LOG_DIR_BASE, f".test_{stage_name}")
+            os.makedirs(test_log_dir, exist_ok=True)
+            
+            # Tentar criar o ambiente
+            print(f"    → Testando criação do ambiente...", end=" ", flush=True)
+            test_env = football_env.create_environment(
+                env_name=level,
+                stacked=True,
+                representation="extracted",
+                rewards="scoring",
+                logdir=test_log_dir,
+                render=False,
+            )
+            
+            # Testar reset
+            obs = test_env.reset()
+            if obs is not None:
+                print("✓")
+                print(f"    ✓ Ambiente criado com sucesso")
+                print(f"    ✓ Observação shape: {obs.shape if hasattr(obs, 'shape') else type(obs)}")
+            else:
+                print("✗")
+                print(f"    ✗ Ambiente criado mas reset() retornou None")
+                all_checks_passed = False
+            
+            # Fechar ambiente
+            test_env.close()
+            
+            # Limpar diretório de teste
+            try:
+                if os.path.exists(test_log_dir):
+                    shutil.rmtree(test_log_dir)
+            except:
+                pass
+                
+        except Exception as e:
+            print("✗")
+            print(f"    ✗ Erro ao criar ambiente: {e}")
+            all_checks_passed = False
+            import traceback
+            traceback.print_exc()
+        
+        # Verificar diretórios do estágio
+        stage_log_dir = os.path.join(LOG_DIR_BASE, stage_name)
+        stage_checkpoint_dir = os.path.join(CHECKPOINT_DIR_BASE, stage_name)
+        stage_eval_dir = os.path.join(EVAL_DIR_BASE, stage_name)
+        
+        try:
+            os.makedirs(stage_log_dir, exist_ok=True)
+            os.makedirs(stage_checkpoint_dir, exist_ok=True)
+            os.makedirs(stage_eval_dir, exist_ok=True)
+            print(f"    ✓ Diretórios do estágio criados")
+        except Exception as e:
+            print(f"    ✗ Erro ao criar diretórios: {e}")
+            all_checks_passed = False
+    
+    # ==========
+    # Check 4: Verificar configurações do curriculum adaptativo
+    # ==========
+    print("\n[CHECK 4/5] Verificando configurações do curriculum adaptativo...")
+    print(f"  ✓ Curriculum adaptativo: {'Ativado' if ADAPTIVE_CURRICULUM else 'Desativado'}")
+    print(f"  ✓ Taxa mínima de vitória para avançar: {MIN_WIN_RATE_TO_ADVANCE:.1%}")
+    print(f"  ✓ Episódios mínimos para avaliação: {MIN_EPISODES_FOR_EVAL}")
+    print(f"  ✓ Tamanho da janela: {WINDOW_SIZE}")
+    print(f"  ✓ Diferença mínima de gols: {MIN_GOAL_DIFFERENCE}")
+    print(f"  ✓ Taxa mínima de vitórias com >=1 gol: {MIN_WIN_BY_GOAL_DIFFERENCE_RATE:.1%}")
+    print(f"  ✓ Gols médios mínimos marcados: {MIN_GOALS_SCORED:.1f}")
+    print(f"  ✓ Gols médios máximos sofridos: {MAX_GOALS_CONCEDED:.1f}")
+    print(f"  ✓ Avaliações de estabilidade necessárias: {STABILITY_EVALUATIONS}")
+    print(f"  ✓ Timesteps máximos por estágio: {MAX_TIMESTEPS_PER_STAGE:,}")
+    print(f"  ✓ Tamanho do chunk de avaliação: {EVAL_CHUNK_SIZE:,}")
+    
+    # ==========
+    # Check 5: Verificar self-play e dependências
+    # ==========
+    print("\n[CHECK 5/5] Verificando self-play e dependências...")
+    print(f"  ✓ Self-play: {'Ativado' if ENABLE_SELF_PLAY else 'Desativado'}")
+    if ENABLE_SELF_PLAY:
+        print(f"  ✓ Taxa de self-play: {SELF_PLAY_RATIO:.1%}")
+        print(f"  ✓ Tamanho do pool: {SELF_PLAY_POOL_SIZE}")
+    
+    # Verificar dependências
+    dependencies = {
+        "stable_baselines3": "PPO",
+        "gfootball": "create_environment",
+        "numpy": "np",
+        "torch": "PyTorch",
+    }
+    
+    for module_name, description in dependencies.items():
+        try:
+            if module_name == "stable_baselines3":
+                from stable_baselines3 import PPO
+            elif module_name == "gfootball":
+                import gfootball.env as football_env
+            elif module_name == "numpy":
+                import numpy
+            elif module_name == "torch":
+                import torch
+            print(f"  ✓ {description} ({module_name}) disponível")
+        except ImportError as e:
+            print(f"  ✗ {description} ({module_name}) não disponível: {e}")
+            all_checks_passed = False
+    
+    # Verificar wandb
+    try:
+        import wandb
+        print(f"  ✓ wandb disponível")
+    except ImportError:
+        print(f"  ⚠ wandb não disponível (logging será desabilitado)")
+    
+    # ==========
+    # Resumo final
+    # ==========
+    print("\n" + "="*80)
+    if all_checks_passed:
+        print("✓ TODAS AS VALIDAÇÕES PASSARAM - Pronto para iniciar treinamento!")
+        print("="*80)
+    else:
+        print("✗ ALGUMAS VALIDAÇÕES FALHARAM - Corrija os problemas antes de continuar")
+        print("="*80)
+    
+    return all_checks_passed
+
+
 def main():
+    # ==========
+    # Validação pré-treinamento
+    # ==========
+    print("\n" + "="*80)
+    print("INICIANDO VALIDAÇÃO DO CURRICULUM LEARNING")
+    print("="*80)
+    
+    if not validate_curriculum_setup():
+        print("\n❌ VALIDAÇÃO FALHOU - Abortando treinamento")
+        print("Por favor, corrija os problemas acima antes de continuar.")
+        return
+    
+    print("\n" + "="*80)
+    print("INICIANDO TREINAMENTO")
+    print("="*80 + "\n")
+    
     # ==========
     # wandb (sempre ativado)
     # ==========
@@ -1205,7 +1464,7 @@ def main():
     print("Inicializando wandb...")
     
     wandb_project = os.environ.get("WANDB_PROJECT", "gfootball_repro_scoring")
-    wandb_run_name = os.environ.get(
+    wandb_run_name_base = os.environ.get(
         "WANDB_RUN_NAME",
         f"curriculum_gfootball_ne{NUM_ENVS}",
     )
@@ -1246,24 +1505,27 @@ def main():
     # Se WANDB_MODE não estiver definido, usar "online" (padrão)
     wandb_mode = os.environ.get("WANDB_MODE", "online")
     
-    # wandb.init() automaticamente pedirá credenciais se necessário em modo online
-    # e o usuário não estiver autenticado
-    wandb_run = wandb.init(
+    # Criar run principal do wandb (para tracking geral do curriculum)
+    wandb_run_main = wandb.init(
         project=wandb_project,
-        name=wandb_run_name,
+        name=wandb_run_name_base,
         config=wandb_config,
         sync_tensorboard=True,
         mode=wandb_mode,
+        tags=["curriculum_main"],
     )
     
     # Verificar se a inicialização foi bem-sucedida
-    if wandb_run is not None:
+    if wandb_run_main is not None:
         print(f"✓ wandb inicializado com sucesso!")
         print(f"  Projeto: {wandb_project}")
-        print(f"  Run: {wandb_run_name}")
-        print(f"  URL: {wandb_run.url if hasattr(wandb_run, 'url') else 'N/A'}")
+        print(f"  Run principal: {wandb_run_name_base}")
+        print(f"  URL: {wandb_run_main.url if hasattr(wandb_run_main, 'url') else 'N/A'}")
     else:
         print("⚠ Aviso: wandb.init() retornou None")
+    
+    # Variável para armazenar o run atual do estágio
+    wandb_run_stage = None
 
     # ==========
     # Detecção de GPU e configuração de dispositivo
@@ -1332,6 +1594,37 @@ def main():
             f"{stage_name} (level={level}, timesteps={total_timesteps:,}) ==="
         )
         
+        # Criar run separado do wandb para este estágio
+        if wandb_run_stage is not None:
+            # Finalizar run anterior se existir
+            try:
+                wandb_run_stage.finish()
+            except:
+                pass
+        
+        wandb_run_stage_name = f"{wandb_run_name_base}_{stage_name}"
+        wandb_run_stage = wandb.init(
+            project=wandb_project,
+            name=wandb_run_stage_name,
+            config={
+                **wandb_config,
+                "stage_name": stage_name,
+                "stage_level": level,
+                "stage_idx": stage_idx,
+                "stage_total_timesteps": total_timesteps,
+            },
+            sync_tensorboard=True,
+            mode=wandb_mode,
+            tags=["curriculum_stage", stage_name],
+            group=wandb_run_name_base,  # Agrupar todos os estágios sob o mesmo grupo
+            reinit=True,  # Permitir múltiplos runs no mesmo processo
+        )
+        
+        if wandb_run_stage is not None:
+            print(f"✓ wandb run criado para estágio '{stage_name}'")
+            print(f"  Run: {wandb_run_stage_name}")
+            print(f"  URL: {wandb_run_stage.url if hasattr(wandb_run_stage, 'url') else 'N/A'}")
+        
         # Mostrar dificuldade atual do curriculum adaptativo
         difficulty = adaptive_curriculum.get_current_difficulty()
         print(
@@ -1377,7 +1670,7 @@ def main():
             stage_name=stage_name,
             print_freq_episodes=10,
             verbose=0,
-            wandb_run=wandb_run,
+            wandb_run=wandb_run_stage,  # Usar run específico do estágio
         )
 
         callbacks: List[BaseCallback] = [
@@ -1515,7 +1808,11 @@ def main():
                             "curriculum/avg_goals_conceded": stats.get("avg_goals_conceded", 0),
                         })
                     
-                    wandb_run.log(log_dict, step=model.num_timesteps)
+                    # Logar no run do estágio e no run principal
+                    if wandb_run_stage is not None:
+                        wandb_run_stage.log(log_dict, step=model.num_timesteps)
+                    if wandb_run_main is not None:
+                        wandb_run_main.log(log_dict, step=model.num_timesteps)
                 except Exception as e:
                     if chunk_count % 10 == 0:  # Log erro ocasionalmente
                         print(f"⚠ Erro ao logar no wandb: {e}")
@@ -1568,7 +1865,11 @@ def main():
                     "stage_final/win_by_1plus_goals_rate": stats.get("win_by_1plus_goals_rate", 0),
                 })
             
-            wandb_run.log(log_dict, step=model.num_timesteps)
+            # Logar no run do estágio e no run principal
+            if wandb_run_stage is not None:
+                wandb_run_stage.log(log_dict, step=model.num_timesteps)
+            if wandb_run_main is not None:
+                wandb_run_main.log(log_dict, step=model.num_timesteps)
         except Exception as e:
             print(f"⚠ Aviso: Erro ao logar fim do estágio no wandb: {e}")
         
@@ -1588,8 +1889,14 @@ def main():
 
     # Finalizar wandb (sempre ativo)
     try:
-        wandb_run.finish()
-        print("✓ wandb finalizado com sucesso!")
+        # Finalizar run do último estágio se ainda estiver ativo
+        if wandb_run_stage is not None:
+            wandb_run_stage.finish()
+            print("✓ wandb run do estágio finalizado com sucesso!")
+        # Finalizar run principal
+        if wandb_run_main is not None:
+            wandb_run_main.finish()
+            print("✓ wandb run principal finalizado com sucesso!")
     except Exception as e:
         print(f"⚠ Aviso: Erro ao finalizar wandb: {e}")
 
