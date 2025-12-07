@@ -1237,6 +1237,9 @@ def validate_curriculum_setup() -> bool:
     
     Retorna True se tudo estiver OK, False caso contrário.
     """
+    # Importar football_env explicitamente para evitar problemas de escopo
+    import gfootball.env as football_env
+    
     print("\n" + "="*80)
     print("VALIDANDO CONFIGURAÇÃO DO CURRICULUM LEARNING")
     print("="*80)
