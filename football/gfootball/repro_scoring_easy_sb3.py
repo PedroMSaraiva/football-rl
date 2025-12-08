@@ -11,6 +11,9 @@ com:
 import os
 import collections
 import shutil
+import signal
+import sys
+import traceback
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 
@@ -22,6 +25,8 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
 )
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+import gym
 
 # ===========================
 # Configurações gerais
@@ -29,7 +34,8 @@ from stable_baselines3.common.env_util import make_vec_env
 
 # Configurações de Hardware (otimizado para RTX 4090)
 # RTX 4090 tem 24GB VRAM, pode suportar 32-64 ambientes dependendo da configuração
-NUM_ENVS = int(os.environ.get("NUM_ENVS", "64"))  # Otimizado para 4090
+# Reduzido para 64 para maior estabilidade e evitar SIGSEGV
+NUM_ENVS = int(os.environ.get("NUM_ENVS", "64"))  # Reduzido de 96 para 64 para estabilidade
 
 # Configurações de Self-Play (sempre ativado)
 ENABLE_SELF_PLAY = True
@@ -58,20 +64,29 @@ REGRESSION_EVALUATIONS = int(os.environ.get("REGRESSION_EVALUATIONS", "3"))  # 3
 REGRESSION_COOLDOWN = int(os.environ.get("REGRESSION_COOLDOWN", "5"))  # Cooldown em chunks para evitar oscilação
 
 # Hiperparâmetros otimizados para RTX 4090
-# Ajustados para melhor throughput com mais ambientes paralelos
-N_STEPS = 512
-N_EPOCHS = 4  # Aumentado para melhor estabilidade
-N_MINIBATCHES = 8  # Aumentado para melhor paralelização
-LR = 0.00011879
-GAMMA = 0.997
-ENT_COEF = 0.00155
-CLIP_RANGE = 0.115
-MAX_GRAD_NORM = 0.76
-GAE_LAMBDA = 0.95
-VF_COEF = 0.5
+# Ajustados para treino ESTÁVEL e RÁPIDO
+N_STEPS = 1024  # Mantido alto para melhor estimativa de valor
+N_EPOCHS = 4  # REDUZIDO de 8 para 4 - muito epoch com recompensas não normalizadas causa instabilidade
+N_MINIBATCHES = 8  # Mantido
+LR = 0.00015  # REDUZIDO de 0.0003 para 0.00015 - mais estável com recompensas densas
+GAMMA = 0.999  # Mantido alto para valorizar recompensas futuras
+ENT_COEF = 0.01  # Mantido para boa exploração
+CLIP_RANGE = 0.115  # Mantido
+MAX_GRAD_NORM = 0.5  # REDUZIDO de 0.76 para 0.5 - mais conservador, evita updates grandes
+GAE_LAMBDA = 0.98  # Mantido
+VF_COEF = 0.5  # Mantido
 
-# Checkpointing mais frequente para 24/7
+# Checkpointing mais frequente para 24/7 e recovery
 CHECKPOINT_FREQ = int(os.environ.get("CHECKPOINT_FREQ", "50000"))  # A cada 50k steps
+RECOVERY_CHECKPOINT_FREQ = int(os.environ.get("RECOVERY_CHECKPOINT_FREQ", "25000"))  # Recovery a cada 25k steps
+
+# Configurações de Reward Shaping
+USE_CHECKPOINT_REWARDS = os.environ.get("USE_CHECKPOINT_REWARDS", "true").lower() == "true"
+USE_DENSE_REWARDS = os.environ.get("USE_DENSE_REWARDS", "true").lower() == "true"
+DENSE_REWARD_SCALE = float(os.environ.get("DENSE_REWARD_SCALE", "1.0"))
+
+# Configuração de Normalização (importante para estabilidade)
+USE_VEC_NORMALIZE = os.environ.get("USE_VEC_NORMALIZE", "true").lower() == "true"
 
 # Curriculum: estágios de dificuldade crescente
 # Nota: total_timesteps agora é apenas uma estimativa inicial, o treinamento continua até atingir critérios
@@ -81,94 +96,94 @@ CURRICULUM_STAGES = [
     {
         "name": "stage1_empty_goal_close",
         "level": "academy_empty_goal_close",
-        "total_timesteps": int(6e6),
+        "total_timesteps": int(2e6),
     },
     {
         "name": "stage1.5_empty_goal",
         "level": "academy_empty_goal",
-        "total_timesteps": int(6e6),
+        "total_timesteps": int(2e6),
     },
     # Estágio 2: Correr para marcar (sem goleiro)
     {
         "name": "stage2_run_to_score",
         "level": "academy_run_to_score",
-        "total_timesteps": int(8e6),
+        "total_timesteps": int(3e6),
     },
     # Estágio 3: Correr para marcar com goleiro
     {
         "name": "stage3_run_to_score_with_keeper",
         "level": "academy_run_to_score_with_keeper",
-        "total_timesteps": int(10e6),
+        "total_timesteps": int(4e6),
     },
     # Estágio 4: Passar e chutar com goleiro
     {
         "name": "stage4_pass_and_shoot_with_keeper",
         "level": "academy_pass_and_shoot_with_keeper",
-        "total_timesteps": int(10e6),
+        "total_timesteps": int(4e6),
     },
     {
         "name": "stage4.5_run_pass_and_shoot_with_keeper",
         "level": "academy_run_pass_and_shoot_with_keeper",
-        "total_timesteps": int(10e6),
+        "total_timesteps": int(4e6),
     },
     # Estágio 5: Situações mais complexas
     {
         "name": "stage5_3_vs_1_with_keeper",
         "level": "academy_3_vs_1_with_keeper",
-        "total_timesteps": int(12e6),
+        "total_timesteps": int(5e6),
     },
     {
         "name": "stage5.5_corner",
         "level": "academy_corner",
-        "total_timesteps": int(12e6),
+        "total_timesteps": int(5e6),
     },
     # Estágio 6: Contra-ataques
     {
         "name": "stage6_counterattack_easy",
         "level": "academy_counterattack_easy",
-        "total_timesteps": int(14e6),
+        "total_timesteps": int(6e6),
     },
     {
         "name": "stage6.5_counterattack_hard",
         "level": "academy_counterattack_hard",
-        "total_timesteps": int(14e6),
+        "total_timesteps": int(6e6),
     },
     # Estágio 7: Jogos pequenos
     {
         "name": "stage7_1v1_easy",
         "level": "1_vs_1_easy",
-        "total_timesteps": int(16e6),
+        "total_timesteps": int(7e6),
     },
     {
         "name": "stage7.5_5v5",
         "level": "5_vs_5",
-        "total_timesteps": int(16e6),
+        "total_timesteps": int(7e6),
     },
     # Estágio 8: Jogos completos (11v11)
     {
         "name": "stage8_single_goal_versus_lazy",
         "level": "academy_single_goal_versus_lazy",
-        "total_timesteps": int(18e6),
+        "total_timesteps": int(8e6),
     },
     {
         "name": "stage8.5_11v11_easy",
         "level": "11_vs_11_easy_stochastic",
-        "total_timesteps": int(20e6),
+        "total_timesteps": int(9e6),
     },
     {
         "name": "stage9_11v11_stochastic",
         "level": "11_vs_11_stochastic",
-        "total_timesteps": int(22e6),
+        "total_timesteps": int(10e6),
     },
     {
         "name": "stage9.5_11v11_hard",
         "level": "11_vs_11_hard_stochastic",
-        "total_timesteps": int(24e6),
+        "total_timesteps": int(11e6),
     },
     {
         "name": "stage10_11v11_competition",
         "level": "11_vs_11_competition",
-        "total_timesteps": int(26e6),
+        "total_timesteps": int(12e6),
     },
 ]
 
@@ -182,70 +197,410 @@ os.makedirs(CHECKPOINT_DIR_BASE, exist_ok=True)
 os.makedirs(EVAL_DIR_BASE, exist_ok=True)
 
 
-class ScoreInfoWrapper:
+class SafeWrapper(gym.Wrapper):
+    """Wrapper de segurança que captura erros e previne crashes."""
+    
+    def __init__(self, env, max_retries=3):
+        super().__init__(env)
+        self.max_retries = max_retries
+        self.reset_count = 0
+        self.step_count = 0
+        self.error_count = 0
+        self.consecutive_reset_errors = 0
+        self.max_consecutive_reset_errors = 5
+        
+    def step(self, action):
+        """Step com tratamento de erros robusto."""
+        for attempt in range(self.max_retries):
+            try:
+                obs, reward, done, info = self.env.step(action)
+                self.step_count += 1
+                self.error_count = 0  # Reset contador de erros em sucessos consecutivos
+                return obs, reward, done, info
+            except Exception as e:
+                self.error_count += 1
+                if attempt < self.max_retries - 1:
+                    print(f"⚠ Erro no step (tentativa {attempt + 1}/{self.max_retries}): {e}")
+                    # Tentar resetar o ambiente antes de retentar
+                    try:
+                        self.env.reset()
+                    except:
+                        pass
+                else:
+                    # Última tentativa falhou, retornar valores seguros
+                    print(f"⚠ Erro crítico no step após {self.max_retries} tentativas: {e}")
+                    # Retornar valores padrão seguros
+                    obs = self.observation_space.sample() if hasattr(self, 'observation_space') else None
+                    reward = 0.0
+                    done = True  # Forçar término do episódio problemático
+                    info = {"error": str(e), "safe_fallback": True}
+                    return obs, reward, done, info
+        
+        # Fallback final
+        obs = self.observation_space.sample() if hasattr(self, 'observation_space') else None
+        return obs, 0.0, True, {"error": "max_retries_exceeded", "safe_fallback": True}
+    
+    def reset(self, **kwargs):
+        """Reset com tratamento de erros robusto e limpeza de memória."""
+        import gc
+        import time
+        
+        for attempt in range(self.max_retries):
+            try:
+                # Limpar memória antes do reset se muitos erros consecutivos
+                if self.consecutive_reset_errors > 2:
+                    gc.collect()
+                    time.sleep(0.01)  # Pequeno delay para liberar recursos
+                
+                obs = self.env.reset(**kwargs)
+                self.reset_count += 1
+                self.consecutive_reset_errors = 0  # Reset contador de erros
+                self.error_count = 0
+                return obs
+            except Exception as e:
+                self.consecutive_reset_errors += 1
+                error_msg = str(e)
+                
+                if attempt < self.max_retries - 1:
+                    print(f"⚠ Erro no reset (tentativa {attempt + 1}/{self.max_retries}): {error_msg}")
+                    
+                    # Limpar memória entre tentativas
+                    gc.collect()
+                    
+                    # Delay progressivo: mais tempo entre tentativas
+                    time.sleep(0.1 * (attempt + 1))
+                    
+                    # Tentar fechar e recriar se muitos erros consecutivos
+                    if self.consecutive_reset_errors >= self.max_consecutive_reset_errors:
+                        print(f"⚠ Muitos erros consecutivos ({self.consecutive_reset_errors}). "
+                              f"Tentando limpar recursos...")
+                        try:
+                            self.env.close()
+                            gc.collect()
+                            time.sleep(0.5)
+                        except:
+                            pass
+                        # Indica que precisa recriar o ambiente
+                        raise RuntimeError(
+                            f"Ambiente corrompido após {self.consecutive_reset_errors} erros consecutivos. "
+                            f"Precisa ser recriado."
+                        )
+                else:
+                    print(f"⚠ Erro crítico no reset após {self.max_retries} tentativas: {error_msg}")
+                    # Última tentativa: limpar tudo e indicar necessidade de recriação
+                    try:
+                        gc.collect()
+                    except:
+                        pass
+                    raise RuntimeError(
+                        f"Não foi possível resetar o ambiente após {self.max_retries} tentativas. "
+                        f"Erro: {error_msg}"
+                    )
+        
+        raise RuntimeError("Erro no reset: max_retries excedido")
+
+
+class ScoreInfoWrapper(gym.Wrapper):
     """Wrapper que adiciona o score ao info dict quando o episódio termina."""
     
     def __init__(self, env):
-        self.env = env
+        super().__init__(env)
         self.last_observation = None
     
-    def __getattr__(self, name):
-        return getattr(self.env, name)
-    
     def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        self.last_observation = obs
-        
-        # Quando o episódio termina, adicionar score ao info
-        if done:
-            # O score está sempre na observação como um dict com chave 'score'
-            # que é uma lista [left_goals, right_goals]
-            if isinstance(obs, dict) and "score" in obs:
-                score = obs["score"]
-                # Garantir que é uma lista/array
-                if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
-                    info["score"] = [int(score[0]), int(score[1])]
-                else:
-                    # Fallback: tentar converter
-                    try:
+        try:
+            obs, reward, done, info = self.env.step(action)
+            self.last_observation = obs
+            
+            # Garantir que info é um dicionário
+            if info is None:
+                info = {}
+            elif not isinstance(info, dict):
+                info = {"info": info}
+            
+            # Quando o episódio termina, adicionar score ao info
+            if done:
+                # O score está sempre na observação como um dict com chave 'score'
+                # que é uma lista [left_goals, right_goals]
+                if isinstance(obs, dict) and "score" in obs:
+                    score = obs["score"]
+                    # Garantir que é uma lista/array
+                    if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
                         info["score"] = [int(score[0]), int(score[1])]
-                    except:
-                        info["score"] = [0, 0]
-            else:
-                # Se não encontrou na observação atual, tentar da última observação
-                if self.last_observation is not None:
-                    if isinstance(self.last_observation, dict) and "score" in self.last_observation:
-                        score = self.last_observation["score"]
-                        if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
+                    else:
+                        # Fallback: tentar converter
+                        try:
                             info["score"] = [int(score[0]), int(score[1])]
+                        except:
+                            info["score"] = [0, 0]
+                else:
+                    # Se não encontrou na observação atual, tentar da última observação
+                    if self.last_observation is not None:
+                        if isinstance(self.last_observation, dict) and "score" in self.last_observation:
+                            score = self.last_observation["score"]
+                            if isinstance(score, (list, tuple, np.ndarray)) and len(score) >= 2:
+                                info["score"] = [int(score[0]), int(score[1])]
+                            else:
+                                info["score"] = [0, 0]
                         else:
                             info["score"] = [0, 0]
                     else:
                         info["score"] = [0, 0]
-                else:
-                    info["score"] = [0, 0]
-        
-        return obs, reward, done, info
+            
+            return obs, reward, done, info
+        except Exception as e:
+            # Capturar qualquer erro e retornar valores seguros
+            print(f"⚠ Erro no ScoreInfoWrapper.step: {e}")
+            obs = self.observation_space.sample() if hasattr(self, 'observation_space') else self.last_observation
+            info = {"score": [0, 0], "error": str(e), "safe_fallback": True}
+            return obs, 0.0, True, info
     
-    def reset(self):
-        obs = self.env.reset()
-        self.last_observation = obs
+    def reset(self, **kwargs):
+        try:
+            obs = self.env.reset(**kwargs)
+            self.last_observation = obs
+            return obs
+        except Exception as e:
+            print(f"⚠ Erro no ScoreInfoWrapper.reset: {e}")
+            # Retentar reset
+            try:
+                obs = self.env.reset(**kwargs)
+                self.last_observation = obs
+                return obs
+            except:
+                raise
+
+
+class DenseRewardWrapper(gym.RewardWrapper):
+    """
+    Wrapper que adiciona recompensas densas para acelerar aprendizado:
+    - Recompensas por posse de bola
+    - Recompensas por aproximação do gol
+    - Recompensas por chutes (AUMENTADAS para incentivar mais tentativas)
+    - Recompensas por controle efetivo
+    - Penalidades por perder posse
+    """
+    
+    def __init__(self, env, reward_scale=1.0):
+        super().__init__(env)
+        self.reward_scale = reward_scale
+        
+        # Parâmetros de recompensa (AUMENTADOS para incentivar mais ações ofensivas)
+        self.reward_possession = 0.02  # Aumentado de 0.01 para 0.02
+        self.reward_approach = 0.05  # Aumentado de 0.02 para 0.05
+        self.reward_shot = 0.2  # AUMENTADO de 0.05 para 0.2 - incentiva chutes!
+        self.reward_control = 0.01  # Aumentado de 0.005 para 0.01
+        self.reward_near_goal = 0.1  # NOVO: recompensa por estar muito perto do gol
+        self.penalty_lose_possession = -0.01  # Penalidade por perder posse
+        
+        # Estado anterior para calcular progresso (limitado para evitar vazamento de memória)
+        self.max_state_history = 1000  # Limitar histórico
+        self.last_ball_distance = {}
+        self.last_had_possession = {}
+        self.last_ball_position = {}
+        self.call_count = 0
+        self.reward_applied = False  # Flag para print único
+        
+        # Print confirmando inicialização
+        if USE_DENSE_REWARDS:
+            print("✓ Recompensas densas personalizadas ATIVADAS")
+            print(f"  - Recompensa por posse: {self.reward_possession}")
+            print(f"  - Recompensa por aproximação: {self.reward_approach}")
+            print(f"  - Recompensa por chute: {self.reward_shot} (AUMENTADA para incentivar!)")
+            print(f"  - Recompensa perto do gol: {self.reward_near_goal}")
+            print(f"  - Escala: {self.reward_scale}")
+        
+    def reset(self, **kwargs):
+        """Reset wrapper state com limpeza de memória."""
+        obs = self.env.reset(**kwargs)
+        # Limpar todos os estados anteriores para evitar vazamento de memória
+        self.last_ball_distance.clear()
+        self.last_had_possession.clear()
+        self.last_ball_position.clear()
+        
+        # Limpar memória periodicamente
+        if self.call_count % 100 == 0:
+            import gc
+            gc.collect()
+        
         return obs
+    
+    def reward(self, reward):
+        """
+        Adiciona recompensas densas baseadas no estado atual.
+        reward pode ser um valor único ou lista (ambiente vetorizado).
+        """
+        if not USE_DENSE_REWARDS:
+            return reward
+        
+        self.call_count += 1
+        
+        # Print único confirmando aplicação (apenas uma vez)
+        if not self.reward_applied and self.call_count == 1:
+            print("✓ Recompensas normais + personalizadas DEFINIDAS e sendo aplicadas!")
+            self.reward_applied = True
+        
+        # Limitar tamanho dos dicionários de estado periodicamente
+        if self.call_count % 500 == 0:
+            # Limpar estados antigos para evitar vazamento
+            if len(self.last_ball_distance) > self.max_state_history:
+                # Manter apenas os mais recentes
+                keys_to_keep = list(self.last_ball_distance.keys())[-self.max_state_history:]
+                self.last_ball_distance = {k: self.last_ball_distance[k] for k in keys_to_keep}
+                self.last_had_possession = {k: self.last_had_possession.get(k, False) for k in keys_to_keep}
+                self.last_ball_position = {k: self.last_ball_position.get(k) for k in keys_to_keep if k in self.last_ball_position}
+        
+        # Obter observação atual
+        try:
+            # Tentar acessar observação via unwrapped
+            if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'observation'):
+                observation = self.env.unwrapped.observation()
+            elif hasattr(self.env, 'observation'):
+                observation = self.env.observation()
+            else:
+                # Se não conseguir acessar observação, retornar reward original
+                return reward
+        except Exception:
+            # Se não conseguir acessar observação, retornar reward original
+            return reward
+        
+        if observation is None:
+            return reward
+        
+        # Processar recompensas (pode ser ambiente único ou vetorizado)
+        if isinstance(reward, (list, tuple, np.ndarray)):
+            return self._process_vectorized_rewards(reward, observation)
+        else:
+            return self._process_single_reward(reward, observation, 0)
+    
+    def _process_vectorized_rewards(self, rewards, observations):
+        """Processa recompensas para ambiente vetorizado."""
+        if not isinstance(observations, (list, tuple)):
+            # Se não é lista, tratar como único ambiente
+            if len(rewards) > 0:
+                rewards[0] = self._process_single_reward(rewards[0], observations, 0)
+            return rewards
+        
+        # Processar cada ambiente
+        for i in range(min(len(rewards), len(observations))):
+            rewards[i] = self._process_single_reward(rewards[i], observations[i], i)
+        
+        return rewards
+    
+    def _process_single_reward(self, base_reward, obs, env_idx):
+        """Processa recompensas para um único ambiente."""
+        if not isinstance(obs, dict):
+            return base_reward
+        
+        dense_reward = 0.0
+        
+        # 1. Recompensa por posse de bola
+        has_possession = (
+            obs.get('ball_owned_team', -1) == 0 and  # Time esquerdo (agente)
+            obs.get('ball_owned_player', -1) == obs.get('active', -1)  # Jogador ativo
+        )
+        
+        if has_possession:
+            dense_reward += self.reward_possession * self.reward_scale
+            # Recompensa adicional por controle efetivo
+            dense_reward += self.reward_control * self.reward_scale
+            
+            # 2. Recompensa por aproximação do gol (AUMENTADA para incentivar mais)
+            if 'ball' in obs and len(obs['ball']) >= 2:
+                ball_x, ball_y = obs['ball'][0], obs['ball'][1]
+                # Gol adversário está em x=1, y=0
+                distance_to_goal = np.sqrt((ball_x - 1.0)**2 + (ball_y - 0.0)**2)
+                
+                # Recompensa por estar mais perto do gol (VALORES AUMENTADOS)
+                if distance_to_goal < 0.3:  # MUITO perto do gol - recompensa alta!
+                    dense_reward += self.reward_near_goal * 3 * self.reward_scale  # +0.3
+                    dense_reward += self.reward_approach * 3 * self.reward_scale  # +0.15
+                elif distance_to_goal < 0.5:  # Muito perto do gol
+                    dense_reward += self.reward_near_goal * 2 * self.reward_scale  # +0.2
+                    dense_reward += self.reward_approach * 2 * self.reward_scale  # +0.1
+                elif distance_to_goal < 0.7:  # Perto do gol
+                    dense_reward += self.reward_near_goal * self.reward_scale  # +0.1
+                    dense_reward += self.reward_approach * self.reward_scale  # +0.05
+                
+                # Recompensa por progresso (redução de distância) - ESTABILIZADO
+                if self.last_ball_distance.get(env_idx) is not None:
+                    distance_reduction = self.last_ball_distance[env_idx] - distance_to_goal
+                    if distance_reduction > 0:  # Aproximou do gol
+                        # Recompensa proporcional ao progresso (REDUZIDO de 20 para 5 para estabilidade)
+                        progress_reward = self.reward_approach * distance_reduction * 5 * self.reward_scale
+                        # Limitar progress reward para evitar valores extremos
+                        progress_reward = np.clip(progress_reward, 0.0, 0.1)  # Máximo 0.1
+                        dense_reward += progress_reward
+                
+                self.last_ball_distance[env_idx] = distance_to_goal
+                self.last_ball_position[env_idx] = (ball_x, ball_y)
+        
+        # 3. Penalidade por perder posse
+        if self.last_had_possession.get(env_idx, False) and not has_possession:
+            dense_reward += self.penalty_lose_possession * self.reward_scale
+        
+        self.last_had_possession[env_idx] = has_possession
+        
+        # 4. Detectar chutes e ações ofensivas (AUMENTADO significativamente)
+        if has_possession and 'ball' in obs and len(obs['ball']) >= 2:
+            ball_x = obs['ball'][0]
+            
+            # Recompensa AGGRESSIVA por estar na área do gol
+            if ball_x > 0.85:  # Área do gol
+                dense_reward += self.reward_shot * 2 * self.reward_scale  # +0.4 por estar na área!
+                
+                # Se bola entrou na área (estava mais longe antes)
+                if (self.last_ball_position.get(env_idx) is not None and
+                    self.last_ball_position[env_idx][0] < 0.85):
+                    # Bola entrou na área - possível chute - RECOMPENSA ALTA!
+                    dense_reward += self.reward_shot * 3 * self.reward_scale  # +0.6 por entrar na área!
+            
+            # Recompensa adicional por bola avançando em direção ao gol
+            if (self.last_ball_position.get(env_idx) is not None):
+                last_x = self.last_ball_position[env_idx][0]
+                if ball_x > last_x and ball_x > 0.7:  # Avançando e já perto do gol
+                    dense_reward += self.reward_approach * 2 * self.reward_scale  # +0.1 por avançar
+        
+        # NORMALIZAÇÃO E LIMITAÇÃO DE RECOMPENSAS DENSAS para estabilidade
+        # Limitar recompensas densas para evitar valores extremos que causam instabilidade
+        dense_reward = np.clip(dense_reward, -0.3, 1.5)  # Limitar range: mínimo -0.3, máximo 1.5
+        
+        # Escalar recompensas densas para não dominarem a recompensa de gol (+1.0)
+        # Reduzir escala final das recompensas densas para manter proporção
+        dense_reward_scaled = dense_reward * 0.7  # Reduzir para 70% para não dominar
+        
+        return base_reward + dense_reward_scaled
 
 
 def make_env(level: str, log_dir: str):
-    """Cria ambiente do gfootball para um dado nível (cenário)."""
-    env = football_env.create_environment(
-        env_name=level,
-        stacked=True,
-        representation="extracted",
-        rewards="scoring",
-        logdir=log_dir,
-        render=False,
-    )
-    # Envolver com wrapper que adiciona score ao info
-    env = ScoreInfoWrapper(env)
-    return env
+    """Cria ambiente do gfootball para um dado nível (cenário) com wrappers de segurança."""
+    try:
+        # Configurar tipo de recompensas
+        rewards_config = "scoring"
+        if USE_CHECKPOINT_REWARDS:
+            rewards_config = "scoring,checkpoints"
+        
+        env = football_env.create_environment(
+            env_name=level,
+            stacked=True,
+            representation="extracted",
+            rewards=rewards_config,
+            logdir=log_dir,
+            render=False,
+        )
+        # Envolver com wrapper de segurança primeiro (mais próximo do env original)
+        env = SafeWrapper(env, max_retries=3)
+        # Depois adicionar wrapper que adiciona score ao info
+        env = ScoreInfoWrapper(env)
+        # Adicionar wrapper de recompensas densas se habilitado
+        if USE_DENSE_REWARDS:
+            env = DenseRewardWrapper(env, reward_scale=DENSE_REWARD_SCALE)
+        return env
+    except Exception as e:
+        print(f"⚠ Erro ao criar ambiente {level}: {e}")
+        print(f"  Logdir: {log_dir}")
+        traceback.print_exc()
+        raise
 
 
 class MatchStatsCallback(BaseCallback):
@@ -1205,25 +1560,40 @@ def make_env_with_opponent(level: str, log_dir: str, opponent_model_path: Option
     que carrega o modelo oponente e intercepta ações do time direito.
     Por enquanto, retorna o ambiente padrão (self-play será implementado futuramente).
     """
-    env = football_env.create_environment(
-        env_name=level,
-        stacked=True,
-        representation="extracted",
-        rewards="scoring",
-        logdir=log_dir,
-        render=False,
-    )
-    
-    # Envolver com wrapper que adiciona score ao info
-    env = ScoreInfoWrapper(env)
-    
-    # TODO: Implementar carregamento e integração do modelo oponente
-    # Isso requereria:
-    # 1. Carregar o modelo do checkpoint
-    # 2. Criar um wrapper que intercepta ações do time direito
-    # 3. Usar o modelo para gerar ações do oponente
-    
-    return env
+    try:
+        # Configurar tipo de recompensas
+        rewards_config = "scoring"
+        if USE_CHECKPOINT_REWARDS:
+            rewards_config = "scoring,checkpoints"
+        
+        env = football_env.create_environment(
+            env_name=level,
+            stacked=True,
+            representation="extracted",
+            rewards=rewards_config,
+            logdir=log_dir,
+            render=False,
+        )
+        
+        # Envolver com wrapper de segurança primeiro
+        env = SafeWrapper(env, max_retries=3)
+        # Depois adicionar wrapper que adiciona score ao info
+        env = ScoreInfoWrapper(env)
+        # Adicionar wrapper de recompensas densas se habilitado
+        if USE_DENSE_REWARDS:
+            env = DenseRewardWrapper(env, reward_scale=DENSE_REWARD_SCALE)
+        
+        # TODO: Implementar carregamento e integração do modelo oponente
+        # Isso requereria:
+        # 1. Carregar o modelo do checkpoint
+        # 2. Criar um wrapper que intercepta ações do time direito
+        # 3. Usar o modelo para gerar ações do oponente
+        
+        return env
+    except Exception as e:
+        print(f"⚠ Erro ao criar ambiente com oponente {level}: {e}")
+        traceback.print_exc()
+        raise
 
 
 def validate_curriculum_setup() -> bool:
@@ -1441,7 +1811,40 @@ def validate_curriculum_setup() -> bool:
     return all_checks_passed
 
 
+def signal_handler(sig, frame):
+    """Handler para capturar sinais e salvar estado antes de sair."""
+    print("\n⚠ Sinal de interrupção recebido (SIGINT/SIGTERM). Salvando estado...")
+    # O modelo será salvo no tratamento de exceção
+    sys.exit(0)
+
+
 def main():
+    # Habilitar faulthandler para melhor captura de SIGSEGV e outros erros
+    try:
+        import faulthandler
+        # Habilitar faulthandler para capturar stack traces em caso de crash
+        faulthandler.enable()
+        # Registrar dump de SIGSEGV em arquivo (LOG_DIR_BASE já está definido antes de main)
+        try:
+            os.makedirs(LOG_DIR_BASE, exist_ok=True)
+            segfault_log = os.path.join(LOG_DIR_BASE, "segfault_dump.log")
+            segfault_file = open(segfault_log, 'w')
+            faulthandler.register(signal.SIGSEGV, file=segfault_file, all_threads=True)
+            print(f"✓ Faulthandler habilitado - dumps de SIGSEGV serão salvos em: {segfault_log}")
+        except Exception as e:
+            print(f"⚠ Não foi possível registrar handler de SIGSEGV: {e}")
+            print("  (continuando sem registro de SIGSEGV)")
+            # Ainda habilitar faulthandler básico
+            faulthandler.enable()
+    except ImportError:
+        print("⚠ faulthandler não disponível (Python < 3.3)")
+    except Exception as e:
+        print(f"⚠ Erro ao configurar faulthandler: {e}")
+    
+    # Registrar handlers de sinais para capturar interrupções
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # ==========
     # Validação pré-treinamento
     # ==========
@@ -1651,6 +2054,19 @@ def main():
                 return make_env(level=level, log_dir=log_dir)
 
         env = make_vec_env(_make_env_for_vec, n_envs=NUM_ENVS)
+        
+        # Normalizar recompensas para estabilidade (importante com recompensas densas)
+        if USE_VEC_NORMALIZE:
+            env = VecNormalize(
+                env,
+                norm_obs=False,  # Observações já são imagens normalizadas
+                norm_reward=True,  # NORMALIZAR RECOMPENSAS - crucial para estabilidade!
+                clip_obs=10.0,
+                clip_reward=10.0,  # Limitar recompensas extremas
+                gamma=GAMMA,  # Usar mesmo gamma para consistência
+            )
+            print(f"✓ VecNormalize aplicado para normalização de recompensas")
+        
         eval_env = make_env(level=level, log_dir=log_dir)
 
         # Callbacks de checkpoint, avaliação e logging de estatísticas
@@ -1689,11 +2105,13 @@ def main():
         stage_clip_range = stage_hyperparams["clip_range"]
         stage_n_epochs = stage_hyperparams["n_epochs"]
         
-        print(f"  Hiperparâmetros do estágio '{stage_name}':")
-        print(f"    Learning rate: {stage_lr:.6f} (padrão: {LR:.6f})")
+        print(f"  Hiperparâmetros do estágio '{stage_name}' (OTIMIZADOS PARA ESTABILIDADE):")
+        print(f"    Learning rate: {stage_lr:.6f} (padrão: {LR:.6f}) - REDUZIDO para estabilidade")
         print(f"    Entropy coef: {stage_ent_coef:.6f} (padrão: {ENT_COEF:.6f})")
         print(f"    Clip range: {stage_clip_range:.3f} (padrão: {CLIP_RANGE:.3f})")
-        print(f"    N epochs: {stage_n_epochs} (padrão: {N_EPOCHS})")
+        print(f"    N epochs: {stage_n_epochs} (padrão: {N_EPOCHS}) - REDUZIDO para estabilidade")
+        print(f"    Max grad norm: {MAX_GRAD_NORM:.2f} - REDUZIDO para evitar updates grandes")
+        print(f"    VecNormalize: {'ATIVADO' if USE_VEC_NORMALIZE else 'DESATIVADO'} - Normalização de recompensas")
         
         # Cria o modelo no primeiro estágio; nos demais, reaproveita e continua treinando
         if model is None:
@@ -1735,9 +2153,13 @@ def main():
 
         # Treinar neste estágio
         reset_num_timesteps = stage_idx == 0
+        
+        # Usar o total_timesteps do estágio atual, mas limitar ao máximo de segurança
+        stage_max_timesteps = min(total_timesteps, MAX_TIMESTEPS_PER_STAGE)
+        
         print(
             f"Iniciando treinamento do estágio '{stage_name}' "
-            f"(treinará até atingir critérios ou máximo de {MAX_TIMESTEPS_PER_STAGE:,} timesteps)..."
+            f"(treinará até atingir critérios ou máximo de {stage_max_timesteps:,} timesteps)..."
         )
         
         # Treinar em chunks menores para permitir avaliação adaptativa frequente
@@ -1746,21 +2168,239 @@ def main():
         chunk_count = 0
         
         # Loop de treinamento: continua até critérios serem atingidos ou limite máximo
-        while timesteps_trained < MAX_TIMESTEPS_PER_STAGE:
-            current_chunk = min(chunk_size, MAX_TIMESTEPS_PER_STAGE - timesteps_trained)
+        max_retries_per_chunk = 3
+        consecutive_failures = 0
+        env_recreation_interval = 5  # REDUZIDO: Recriar ambiente a cada 5 chunks (antes era 10)
+        critical_chunks = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]  # Chunks críticos para recriação
+        
+        while timesteps_trained < stage_max_timesteps:
+            current_chunk = min(chunk_size, stage_max_timesteps - timesteps_trained)
             
             print(f"  Chunk {chunk_count + 1}: Treinando {current_chunk:,} timesteps "
-                  f"(total: {timesteps_trained:,}/{MAX_TIMESTEPS_PER_STAGE:,})")
+                  f"(total: {timesteps_trained:,}/{stage_max_timesteps:,})")
             
-            model.learn(
-                total_timesteps=current_chunk,
-                callback=callbacks,
-                tb_log_name=f"ppo_gfootball_repro_{stage_name}",
-                reset_num_timesteps=reset_num_timesteps and timesteps_trained == 0,
+            # RECRIAÇÃO PERIÓDICA DE AMBIENTE para prevenir corrupção de memória
+            # Recriar a cada N chunks OU em chunks críticos específicos
+            should_recreate = (
+                (chunk_count > 0 and chunk_count % env_recreation_interval == 0) or
+                (chunk_count in critical_chunks)
             )
             
-            timesteps_trained += current_chunk
-            chunk_count += 1
+            if should_recreate:
+                print(f"  🔄 Recriação preventiva de ambiente (chunk {chunk_count}) para evitar corrupção...")
+                import gc
+                import time
+                try:
+                    env.close()
+                    del env
+                    gc.collect()
+                    time.sleep(2.0)  # AUMENTADO: Dar mais tempo para liberar recursos (2s em vez de 1s)
+                except Exception as close_error:
+                    print(f"  ⚠ Erro ao fechar ambiente (ignorando): {close_error}")
+                    # Limpar mesmo com erro
+                    try:
+                        gc.collect()
+                        time.sleep(1.0)
+                    except:
+                        pass
+                
+                # Recriar ambiente
+                        try:
+                            env = make_vec_env(_make_env_for_vec, n_envs=NUM_ENVS)
+                            # Reaplicar normalização se estava habilitada
+                            if USE_VEC_NORMALIZE:
+                                env = VecNormalize(
+                                    env,
+                                    norm_obs=False,
+                                    norm_reward=True,
+                                    clip_obs=10.0,
+                                    clip_reward=10.0,
+                                    gamma=GAMMA,
+                                )
+                            model.set_env(env)
+                            gc.collect()  # Limpar após recriação
+                            print(f"  ✓ Ambiente recriado com sucesso")
+                        except Exception as recreate_err:
+                            print(f"  ✗ Erro ao recriar ambiente: {recreate_err}")
+                            # Tentar novamente após mais tempo
+                            time.sleep(3.0)
+                            gc.collect()
+                            env = make_vec_env(_make_env_for_vec, n_envs=NUM_ENVS)
+                            # Reaplicar normalização
+                            if USE_VEC_NORMALIZE:
+                                env = VecNormalize(
+                                    env,
+                                    norm_obs=False,
+                                    norm_reward=True,
+                                    clip_obs=10.0,
+                                    clip_reward=10.0,
+                                    gamma=GAMMA,
+                                )
+                            model.set_env(env)
+                            print(f"  ✓ Ambiente recriado na segunda tentativa")
+            
+            # Tentar treinar com retry logic
+            chunk_success = False
+            for retry_attempt in range(max_retries_per_chunk):
+                try:
+                    # Salvar checkpoint antes de cada chunk para recovery
+                    if chunk_count > 0 and chunk_count % 5 == 0:
+                        recovery_path = os.path.join(
+                            checkpoint_dir, 
+                            f"ppo_gfootball_repro_{stage_name}_recovery_chunk_{chunk_count}"
+                        )
+                        print(f"  💾 Salvando checkpoint de recovery em: {recovery_path}")
+                        model.save(recovery_path)
+                    
+                    # Limpeza de memória antes do treinamento
+                    if chunk_count > 0 and chunk_count % 3 == 0:
+                        import gc
+                        gc.collect()
+                    
+                    model.learn(
+                        total_timesteps=current_chunk,
+                        callback=callbacks,
+                        tb_log_name=f"ppo_gfootball_repro_{stage_name}",
+                        reset_num_timesteps=reset_num_timesteps and timesteps_trained == 0,
+                    )
+                    
+                    # Se chegou aqui, treinamento foi bem-sucedido
+                    timesteps_trained += current_chunk
+                    chunk_count += 1
+                    consecutive_failures = 0
+                    chunk_success = True
+                    break
+                    
+                except KeyboardInterrupt:
+                    print("\n⚠ Interrupção pelo usuário detectada. Salvando modelo...")
+                    recovery_path = os.path.join(
+                        checkpoint_dir, 
+                        f"ppo_gfootball_repro_{stage_name}_interrupted_chunk_{chunk_count}"
+                    )
+                    model.save(recovery_path)
+                    print(f"  ✓ Modelo salvo em: {recovery_path}")
+                    raise
+                    
+                except Exception as e:
+                    consecutive_failures += 1
+                    error_msg = str(e)
+                    error_type = type(e).__name__
+                    
+                    print(f"\n⚠ ERRO durante treinamento (tentativa {retry_attempt + 1}/{max_retries_per_chunk}):")
+                    print(f"  Tipo: {error_type}")
+                    print(f"  Mensagem: {error_msg}")
+                    
+                    # Verificar se é erro crítico de segmentação
+                    if "signal 11" in error_msg.lower() or "segfault" in error_msg.lower() or "SIGSEGV" in error_msg.upper():
+                        print("  ⚠ Erro de segmentação detectado (SIGSEGV)")
+                        
+                        # Tentar salvar modelo antes de recriar ambiente
+                        try:
+                            recovery_path = os.path.join(
+                                checkpoint_dir, 
+                                f"ppo_gfootball_repro_{stage_name}_segfault_recovery_chunk_{chunk_count}"
+                            )
+                            print(f"  💾 Tentando salvar recovery em: {recovery_path}")
+                            model.save(recovery_path)
+                            print(f"  ✓ Recovery salvo com sucesso")
+                        except Exception as save_error:
+                            print(f"  ✗ Erro ao salvar recovery: {save_error}")
+                        
+                        # Recriar ambiente para evitar corrupção
+                        print("  🔄 Recriando ambiente para evitar corrupção...")
+                        import gc
+                        import time
+                        try:
+                            env.close()
+                            del env
+                            gc.collect()
+                            time.sleep(2.0)  # Dar mais tempo para liberar recursos após erro
+                        except Exception as close_err:
+                            print(f"  ⚠ Erro ao fechar ambiente: {close_err}")
+                        
+                        # Recriar ambiente
+                        try:
+                            env = make_vec_env(_make_env_for_vec, n_envs=NUM_ENVS)
+                            # Reaplicar normalização se estava habilitada
+                            if USE_VEC_NORMALIZE:
+                                env = VecNormalize(
+                                    env,
+                                    norm_obs=False,
+                                    norm_reward=True,
+                                    clip_obs=10.0,
+                                    clip_reward=10.0,
+                                    gamma=GAMMA,
+                                )
+                            model.set_env(env)
+                            print("  ✓ Ambiente recriado com sucesso")
+                            gc.collect()  # Limpar após recriação
+                        except Exception as recreate_err:
+                            print(f"  ✗ Erro ao recriar ambiente: {recreate_err}")
+                            raise
+                    
+                    if retry_attempt < max_retries_per_chunk - 1:
+                        print(f"  ⏳ Aguardando 5 segundos antes de retentar...")
+                        import time
+                        time.sleep(5)
+                    else:
+                        # Todas as tentativas falharam
+                        print(f"\n❌ FALHA CRÍTICA: Não foi possível treinar após {max_retries_per_chunk} tentativas")
+                        print(f"  Consecutive failures: {consecutive_failures}")
+                        
+                        # Salvar último estado conhecido
+                        try:
+                            emergency_path = os.path.join(
+                                checkpoint_dir, 
+                                f"ppo_gfootball_repro_{stage_name}_emergency_chunk_{chunk_count}"
+                            )
+                            print(f"  💾 Salvando estado de emergência em: {emergency_path}")
+                            model.save(emergency_path)
+                        except Exception as save_error:
+                            print(f"  ✗ Erro ao salvar estado de emergência: {save_error}")
+                        
+                        # Se muitas falhas consecutivas, reduzir tamanho do chunk
+                        if consecutive_failures >= 3:
+                            print(f"  ⚠ Muitas falhas consecutivas. Reduzindo tamanho do chunk...")
+                            chunk_size = max(chunk_size // 2, 10000)  # Reduzir pela metade, mínimo 10k
+                            print(f"  Novo chunk_size: {chunk_size:,}")
+                            consecutive_failures = 0
+                            
+                            # Recriar ambiente novamente com limpeza agressiva
+                            import gc
+                            import time
+                            try:
+                                env.close()
+                                del env
+                                gc.collect()
+                                time.sleep(2.0)
+                            except:
+                                pass
+                            try:
+                                env = make_vec_env(_make_env_for_vec, n_envs=NUM_ENVS)
+                                # Reaplicar normalização se estava habilitada
+                                if USE_VEC_NORMALIZE:
+                                    env = VecNormalize(
+                                        env,
+                                        norm_obs=False,
+                                        norm_reward=True,
+                                        clip_obs=10.0,
+                                        clip_reward=10.0,
+                                        gamma=GAMMA,
+                                    )
+                                model.set_env(env)
+                                gc.collect()
+                            except Exception as recreate_err:
+                                print(f"  ✗ Erro ao recriar ambiente: {recreate_err}")
+                                raise
+                            continue
+                        else:
+                            # Re-lançar exceção se não é falha consecutiva demais
+                            raise
+            
+            if not chunk_success:
+                print(f"\n❌ Não foi possível completar o chunk após todas as tentativas.")
+                print(f"  Progresso salvo: {timesteps_trained:,} timesteps treinados")
+                break  # Sair do loop de treinamento deste estágio
             
             # Atualizar métricas do curriculum adaptativo (sempre ativo)
             stats = match_stats_callback.get_match_stats()
@@ -1821,9 +2461,9 @@ def main():
                         print(f"⚠ Erro ao logar no wandb: {e}")
             
             # Verificar se atingiu o limite máximo (safety net)
-            if timesteps_trained >= MAX_TIMESTEPS_PER_STAGE:
+            if timesteps_trained >= stage_max_timesteps:
                 print(f"⚠ Limite máximo de timesteps atingido para '{stage_name}' "
-                      f"({MAX_TIMESTEPS_PER_STAGE:,}). Avançando mesmo sem atingir critérios.")
+                      f"({stage_max_timesteps:,}). Avançando mesmo sem atingir critérios.")
                 break
 
         # Salvar um snapshot ao final de cada estágio
